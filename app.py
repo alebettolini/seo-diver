@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import tempfile
 import warnings
+import struct
 from io import BytesIO
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse, urldefrag, parse_qsl, urlencode
@@ -49,7 +50,7 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. CORE REGEX, CONSTANTS & URL HELPERS
+# 1. CORE REGEX, CONSTANTS & STANDARDS
 # ==============================================================================
 RE_SITEMAP_DIRECTIVE = re.compile(r'^\s*Sitemap:\s*(\S+)', re.M | re.I)
 RE_CONTENT_TYPE_CHARSET = re.compile(r'charset=([\w-]+)', re.I)
@@ -72,6 +73,54 @@ NON_HTML_EXTS = {
     '.json', '.txt', '.csv', '.woff', '.woff2', '.ttf', '.eot', '.rss',
     '.atom'
 }
+
+# ISO 639-1 Language Codes & ISO 3166-1 Alpha-2 Country Codes
+ISO_639_1_LANGS = {
+    'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
+    'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs', 'ca', 'ce',
+    'ch', 'co', 'cr', 'cs', 'cu', 'cv', 'cy', 'da', 'de', 'dv', 'dz', 'ee',
+    'el', 'en', 'eo', 'es', 'et', 'eu', 'fa', 'ff', 'fi', 'fj', 'fo', 'fr',
+    'fy', 'ga', 'gd', 'gl', 'gn', 'gu', 'gv', 'ha', 'he', 'hi', 'ho', 'hr',
+    'ht', 'hu', 'hy', 'hz', 'ia', 'id', 'ie', 'ig', 'ii', 'ik', 'io', 'is',
+    'it', 'iu', 'ja', 'jv', 'ka', 'kg', 'ki', 'kj', 'kk', 'kl', 'km', 'kn',
+    'ko', 'kr', 'ks', 'ku', 'kv', 'kw', 'ky', 'la', 'lb', 'lg', 'li', 'ln',
+    'lo', 'lt', 'lu', 'lv', 'mg', 'mh', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms',
+    'mt', 'my', 'na', 'nb', 'nd', 'ne', 'ng', 'nl', 'nn', 'no', 'nr', 'nv',
+    'ny', 'oc', 'oj', 'om', 'or', 'os', 'pa', 'pi', 'pl', 'ps', 'pt', 'qu',
+    'rm', 'rn', 'ro', 'ru', 'rw', 'sa', 'sc', 'sd', 'se', 'sg', 'si', 'sk',
+    'sl', 'sm', 'sn', 'so', 'sq', 'sr', 'ss', 'st', 'su', 'sv', 'sw', 'ta',
+    'te', 'tg', 'th', 'ti', 'tk', 'tl', 'tn', 'to', 'tr', 'ts', 'tt', 'tw',
+    'ty', 'ug', 'uk', 'ur', 'uz', 've', 'vi', 'vo', 'wa', 'wo', 'xh', 'yi',
+    'yo', 'za', 'zh', 'zu'
+}
+
+ISO_3166_1_COUNTRIES = {
+    'ad', 'ae', 'af', 'ag', 'ai', 'al', 'am', 'ao', 'aq', 'ar', 'as', 'at',
+    'au', 'aw', 'ax', 'az', 'ba', 'bb', 'bd', 'be', 'bf', 'bg', 'bh', 'bi',
+    'bj', 'bl', 'bm', 'bn', 'bo', 'bq', 'br', 'bs', 'bt', 'bv', 'bw', 'by',
+    'bz', 'ca', 'cc', 'cd', 'cf', 'cg', 'ch', 'ci', 'ck', 'cl', 'cm', 'cn',
+    'co', 'cr', 'cu', 'cv', 'cw', 'cx', 'cy', 'cz', 'de', 'dj', 'dk', 'dm',
+    'do', 'dz', 'ec', 'ee', 'eg', 'eh', 'er', 'es', 'et', 'fi', 'fj', 'fk',
+    'fm', 'fo', 'fr', 'ga', 'gb', 'gd', 'ge', 'gf', 'gg', 'gh', 'gi', 'gl',
+    'gm', 'gn', 'gp', 'gq', 'gr', 'gs', 'gt', 'gu', 'gw', 'gy', 'hk', 'hm',
+    'hn', 'hr', 'ht', 'hu', 'id', 'ie', 'il', 'im', 'in', 'io', 'iq', 'ir',
+    'is', 'it', 'je', 'jm', 'jo', 'jp', 'ke', 'kg', 'kh', 'ki', 'km', 'kn',
+    'kp', 'kr', 'kw', 'ky', 'kz', 'la', 'lb', 'lc', 'li', 'lk', 'lr', 'ls',
+    'lt', 'lu', 'lv', 'ly', 'ma', 'mc', 'md', 'me', 'mf', 'mg', 'mh', 'mk',
+    'ml', 'mm', 'mn', 'mo', 'mp', 'mq', 'mr', 'ms', 'mt', 'mu', 'mv', 'mw',
+    'mx', 'my', 'mz', 'na', 'nc', 'ne', 'nf', 'ng', 'ni', 'nl', 'no', 'np',
+    'nr', 'nu', 'nz', 'om', 'pa', 'pe', 'pf', 'pg', 'ph', 'pk', 'pl', 'pm',
+    'pn', 'pr', 'ps', 'pt', 'pw', 'py', 'qa', 're', 'ro', 'rs', 'ru', 'rw',
+    'sa', 'sb', 'sc', 'sd', 'se', 'sg', 'sh', 'si', 'sj', 'sk', 'sl', 'sm',
+    'sn', 'so', 'sr', 'ss', 'st', 'sv', 'sx', 'sy', 'sz', 'tc', 'td', 'tf',
+    'tg', 'th', 'tj', 'tk', 'tl', 'tm', 'tn', 'to', 'tr', 'tt', 'tv', 'tw',
+    'tz', 'ua', 'ug', 'um', 'us', 'uy', 'uz', 'va', 'vc', 've', 'vg', 'vi',
+    'vn', 'vu', 'wf', 'ws', 'ye', 'yt', 'za', 'zm', 'zw'
+}
+
+# ==============================================================================
+# 2. ADVANCED MATHEMATICAL & INTELLIGENCE ENGINES
+# ==============================================================================
 
 def extract_registered_domain(netloc):
     if HAS_TLDEXTRACT:
@@ -129,6 +178,247 @@ def estimate_pixel_width(text, scale=1.0):
     total = sum(TITLE_GLYPH_WIDTHS['narrow'] if c in NARROW_CHARS else TITLE_GLYPH_WIDTHS['wide'] if c in WIDE_CHARS else TITLE_GLYPH_WIDTHS['default'] for c in text)
     return round(total * scale, 1)
 
+def compute_simhash_64(text: str) -> int:
+    """
+    Computes a 64-bit SimHash fingerprint for near-duplicate content detection.
+    Uses word 3-grams and token weighting.
+    """
+    if not text or len(text.strip()) < 10:
+        return 0
+    words = re.findall(r'\w+', text.lower())
+    if not words:
+        return 0
+    
+    # Generate 3-grams and unigrams
+    features = []
+    for i in range(len(words) - 2):
+        features.append(f"{words[i]}_{words[i+1]}_{words[i+2]}")
+    features.extend(words)
+    
+    feature_counts = Counter(features)
+    v = [0] * 64
+    for feat, count in feature_counts.items():
+        h = int(hashlib.md5(feat.encode('utf-8')).hexdigest()[:16], 16)
+        for i in range(64):
+            bit = (h >> i) & 1
+            if bit == 1:
+                v[i] += count
+            else:
+                v[i] -= count
+                
+    fingerprint = 0
+    for i in range(64):
+        if v[i] > 0:
+            fingerprint |= (1 << i)
+    return fingerprint
+
+def simhash_similarity(h1: int, h2: int) -> float:
+    """Computes similarity percentage between two 64-bit SimHash fingerprints."""
+    if h1 == 0 or h2 == 0:
+        return 0.0
+    x = h1 ^ h2
+    hamming_dist = bin(x).count('1')
+    return round((1.0 - (hamming_dist / 64.0)) * 100, 1)
+
+def calculate_internal_pagerank(df_pages, df_links_internal, damping=0.85, max_iter=100, tol=1e-6):
+    """
+    Computes exact internal PageRank across the site link graph using power iteration.
+    """
+    if df_pages.empty:
+        return {}, {}, {}
+    
+    nodes = list(df_pages['Address'].apply(normalize_url).unique())
+    N = len(nodes)
+    if N == 0:
+        return {}, {}, {}
+    
+    node_set = set(nodes)
+    outlinks = defaultdict(set)
+    inlinks = defaultdict(set)
+    
+    if not df_links_internal.empty:
+        for _, row in df_links_internal.iterrows():
+            s = normalize_url(row['source'])
+            d = normalize_url(row['destination'])
+            if s in node_set and d in node_set and s != d:
+                outlinks[s].add(d)
+                inlinks[d].add(s)
+                
+    pr = {node: 1.0 / N for node in nodes}
+    
+    for _ in range(max_iter):
+        dangling_sum = sum(pr[n] for n in nodes if len(outlinks[n]) == 0)
+        new_pr = {}
+        total_diff = 0.0
+        
+        for n in nodes:
+            in_sum = sum(pr[in_node] / len(outlinks[in_node]) for in_node in inlinks[n])
+            rank = ((1.0 - damping) / N) + (damping * (dangling_sum / N)) + (damping * in_sum)
+            new_pr[n] = rank
+            total_diff += abs(rank - pr[n])
+            
+        pr = new_pr
+        if total_diff < tol:
+            break
+            
+    min_pr = min(pr.values()) if pr else 1e-12
+    max_pr = max(pr.values()) if pr else 1.0
+    
+    score_dict = {}
+    for n, val in pr.items():
+        if max_pr == min_pr:
+            score_dict[n] = 50.0
+        else:
+            log_min = -12.0 if min_pr <= 0 else min(0.0, float(pd.np.log10(min_pr) if hasattr(pd, 'np') else __import__('math').log10(min_pr)))
+            log_max = float(pd.np.log10(max_pr) if hasattr(pd, 'np') else __import__('math').log10(max_pr))
+            log_val = float(pd.np.log10(val) if hasattr(pd, 'np') else __import__('math').log10(val))
+            norm = (log_val - log_min) / (log_max - log_min + 1e-9)
+            score_dict[n] = round(max(0.0, min(100.0, norm * 100)), 1)
+            
+    sorted_nodes = sorted(nodes, key=lambda x: pr[x])
+    percentile_dict = {n: round((idx / max(1, N - 1)) * 100, 1) for idx, n in enumerate(sorted_nodes)}
+    
+    return pr, score_dict, percentile_dict
+
+def validate_hreflang_matrix(df_internal):
+    """
+    Validates bidirectional hreflang clusters, self-referential tags, and ISO conformance.
+    """
+    if df_internal.empty or 'Hreflang Tags' not in df_internal.columns:
+        return pd.DataFrame(), 0
+    
+    crawled_map = {normalize_url(row['Address']): row for _, row in df_internal.iterrows()}
+    records = []
+    
+    for _, page in df_internal.iterrows():
+        source_url = normalize_url(page['Address'])
+        tags_json = page.get('Hreflang Tags', '')
+        if not tags_json:
+            continue
+        try:
+            pairs = json.loads(tags_json)
+        except Exception:
+            continue
+            
+        has_self_ref = False
+        for hl_code, target_url in pairs:
+            norm_target = normalize_url(target_url)
+            hl_code_clean = hl_code.strip().lower()
+            
+            if norm_target == source_url:
+                has_self_ref = True
+                
+            # 1. ISO Code Validation
+            iso_error = ""
+            if hl_code_clean != 'x-default':
+                parts = hl_code_clean.split('-')
+                if len(parts) == 1:
+                    if parts[0] not in ISO_639_1_LANGS:
+                        iso_error = f"Invalid Language Code '{parts[0]}'"
+                elif len(parts) == 2:
+                    if parts[0] not in ISO_639_1_LANGS:
+                        iso_error = f"Invalid Language Code '{parts[0]}'"
+                    elif parts[1] not in ISO_3166_1_COUNTRIES:
+                        if parts[1] == 'uk':
+                            iso_error = "Invalid Country 'uk' (Use 'gb' for Great Britain)"
+                        else:
+                            iso_error = f"Invalid Country Code '{parts[1]}'"
+                else:
+                    iso_error = f"Malformed Hreflang Syntax '{hl_code_clean}'"
+                    
+            # 2. Reciprocal Return Tag Validation & Target Status
+            return_status = "Valid"
+            target_status = "Unknown"
+            
+            if norm_target in crawled_map:
+                target_page = crawled_map[norm_target]
+                target_status = str(target_page.get('Status Code', '200'))
+                if target_page.get('Indexability') == 'Non-Indexable':
+                    target_status += " (Non-Indexable)"
+                    
+                target_tags = target_page.get('Hreflang Tags', '')
+                reciprocal_found = False
+                if target_tags:
+                    try:
+                        t_pairs = json.loads(target_tags)
+                        for _, t_target in t_pairs:
+                            if normalize_url(t_target) == source_url:
+                                reciprocal_found = True
+                                break
+                    except Exception:
+                        pass
+                if not reciprocal_found:
+                    return_status = "Missing Return Tag"
+            else:
+                target_status = "Not Crawled / External"
+                return_status = "Unverified (External URL)"
+                
+            records.append({
+                "Source URL": source_url,
+                "Hreflang Code": hl_code_clean,
+                "Target URL": target_url,
+                "Target Status": target_status,
+                "Return Tag Status": return_status,
+                "ISO Validation": iso_error if iso_error else "Valid",
+                "Has Self-Ref": "Yes" if has_self_ref else "Pending"
+            })
+            
+        if not has_self_ref and pairs:
+            for r in records:
+                if r["Source URL"] == source_url:
+                    r["Has Self-Ref"] = "No (Missing Self-Reference)"
+
+    df_hreflang = pd.DataFrame(records)
+    issue_count = 0
+    if not df_hreflang.empty:
+        issue_count = (
+            (df_hreflang['Return Tag Status'] == 'Missing Return Tag') |
+            (df_hreflang['ISO Validation'] != 'Valid') |
+            (df_hreflang['Has Self-Ref'].str.startswith('No')) |
+            (df_hreflang['Target Status'].str.contains('Non-Indexable|404|500', na=False))
+        ).sum()
+        
+    return df_hreflang, int(issue_count)
+
+def parse_gsc_performance_data(file_bytes_or_buffer):
+    """
+    Parses Google Search Console CSV exports (e.g. Pages.csv) and standardizes columns.
+    """
+    try:
+        df = pd.read_csv(file_bytes_or_buffer)
+        col_map = {}
+        for col in df.columns:
+            c_low = col.lower().strip()
+            if 'page' in c_low or 'url' in c_low or 'top pages' in c_low:
+                col_map[col] = 'GSC_URL'
+            elif 'click' in c_low:
+                col_map[col] = 'GSC_Clicks'
+            elif 'impression' in c_low:
+                col_map[col] = 'GSC_Impressions'
+            elif 'ctr' in c_low:
+                col_map[col] = 'GSC_CTR'
+            elif 'position' in c_low:
+                col_map[col] = 'GSC_Position'
+                
+        df = df.rename(columns=col_map)
+        if 'GSC_URL' not in df.columns:
+            return pd.DataFrame()
+            
+        df['__norm_gsc'] = df['GSC_URL'].apply(lambda u: normalize_url(str(u), strip_trailing_slash=True, strip_www=True))
+        for num_col in ['GSC_Clicks', 'GSC_Impressions', 'GSC_Position']:
+            if num_col in df.columns:
+                df[num_col] = pd.to_numeric(df[num_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+        if 'GSC_CTR' in df.columns:
+            df['GSC_CTR'] = df['GSC_CTR'].astype(str).str.rstrip('%')
+            df['GSC_CTR'] = pd.to_numeric(df['GSC_CTR'], errors='coerce').fillna(0)
+            
+        return df[['__norm_gsc', 'GSC_URL', 'GSC_Clicks', 'GSC_Impressions', 'GSC_CTR', 'GSC_Position']].drop_duplicates(subset=['__norm_gsc'])
+    except Exception:
+        return pd.DataFrame()
+
+# ==============================================================================
+# 3. HTML PARSER & CONTENT EXTRACTION
+# ==============================================================================
 def recursive_schema_types(obj):
     types = []
     if isinstance(obj, dict):
@@ -197,9 +487,6 @@ def content_for_hashing(soup):
     except Exception:
         return ""
 
-# ==============================================================================
-# 2. HTML PARSER & DATA ROW BUILDER
-# ==============================================================================
 def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False):
     row = {
         "Address": url, "Status Code": 0, "Final URL": "", "Content Type": "",
@@ -217,7 +504,7 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "Redirect Chain": "None", "Redirect Hops": 0, "Has Redirect Loop": "No",
         "Word Count": 0, "Text/HTML Ratio (%)": 0, "SPA App Shell": "No",
         "Internal Outlinks": 0, "External Outlinks": 0, "Nofollow Outlinks": 0,
-        "Size (KB)": 0, "TTFB (s)": 0, "Content Hash": "", "Last-Modified": "", "ETag": "",
+        "Size (KB)": 0, "TTFB (s)": 0, "Content Hash": "", "SimHash": 0, "Last-Modified": "", "ETag": "",
     }
     if exc:
         row["Indexability"] = "Error"
@@ -316,7 +603,6 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     canon_link = http_canon or (urljoin(resp.url, canons[0].get('href', '').strip()) if canons and canons[0].get('href', '').strip() else "")
     row["Canonical Link"] = canon_link
     
-    # Path & host normalized canonical matching
     if canon_link:
         norm_canon = normalize_url(canon_link, strip_trailing_slash=True, strip_www=True)
         norm_resp = normalize_url(resp.url, strip_trailing_slash=True, strip_www=True)
@@ -403,7 +689,7 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "size_kb": 0
     } for img in extract_images(soup, resp.url)]
 
-    # Compute visible text and word count
+    # Compute visible text, word count & SimHash
     clean_soup = BeautifulSoup(resp.text, 'html.parser')
     for tag in list(clean_soup(['script', 'style', 'noscript', 'template', 'iframe', 'svg'])):
         try:
@@ -421,14 +707,15 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     if len(resp.content) > 100:
         row["Text/HTML Ratio (%)"] = round(len(body_text) / len(resp.content) * 100, 2)
 
-    # Content Deduplication Hash (preserves article and product content containers)
+    # Content Deduplication Hash (Exact MD5 + 64-bit SimHash)
     normalized_content = content_for_hashing(clean_soup)
     row["Content Hash"] = hashlib.md5(normalized_content.encode('utf-8', errors='replace')).hexdigest() if normalized_content else ""
+    row["SimHash"] = compute_simhash_64(normalized_content) if normalized_content else 0
 
     return row, link_rows, image_rows
 
 # ==============================================================================
-# 3. SITEMAP & ROBOTS DISCOVERY ENGINE
+# 4. SITEMAP & ASYNC CRAWLER ENGINE
 # ==============================================================================
 def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
     candidate_hosts = {target_hostname, f"www.{target_hostname.replace('www.', '')}", target_hostname.replace('www.', '')}
@@ -466,14 +753,12 @@ def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
                     continue
             
             soup = BeautifulSoup(text, 'lxml-xml' if 'xml' in text[:200] else 'html.parser')
-            # Extract child sitemaps strictly into the sitemap parsing queue
             for sm in soup.find_all('sitemap'):
                 loc = sm.find('loc')
                 if loc and loc.text and loc.text.strip():
                     child_sm = loc.text.strip()
                     if child_sm not in seen_sitemaps:
                         queue.append(child_sm)
-            # Extract page URLs strictly from <url><loc> entries
             for u in soup.find_all('url'):
                 loc = u.find('loc')
                 if loc and loc.text and loc.text.strip().startswith('http'):
@@ -488,9 +773,6 @@ def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
             sitemap_pages.add(norm)
     return sitemap_pages
 
-# ==============================================================================
-# 4. ASYNC CRAWLER ENGINE (STREAMLIT DIRECT RUNNER)
-# ==============================================================================
 RETRY_STATUSES = {429, 503, 520, 522, 524}
 MAX_RETRIES = 3
 
@@ -507,7 +789,6 @@ async def execute_crawl(config, progress_callback, status_callback):
     headers = config['headers']
     db_path = config['db_path']
 
-    # Pre-flight probe to discover preferred canonical host
     with requests.Session() as s:
         s.headers.update(headers)
         try:
@@ -573,7 +854,6 @@ async def execute_crawl(config, progress_callback, status_callback):
         except Exception:
             pass
 
-    # Architectural Fix 1 & 2: Seed queue with ONLY the Start URL at Depth 0
     visited, queued, queue = set(), set(), deque()
     seed = normalize_url(base_url)
     if is_crawlable_url(seed):
@@ -633,7 +913,6 @@ async def execute_crawl(config, progress_callback, status_callback):
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as aio_session:
         while (queue or (pages_counted < crawl_limit and any(u not in visited and u not in queued for u in sitemap_pages))) and pages_counted < crawl_limit and processed < fetch_ceiling:
-            # Low-priority queue padding from sitemap discovery only after primary site graph is explored
             if not queue and pages_counted < crawl_limit:
                 unvisited_sitemap = [u for u in sitemap_pages if u not in visited and u not in queued]
                 if unvisited_sitemap:
@@ -722,9 +1001,9 @@ async def execute_crawl(config, progress_callback, status_callback):
     return target_hostname
 
 # ==============================================================================
-# 5. POST-CRAWL DATA ANALYSIS & REPORT GENERATOR
+# 5. POST-CRAWL DATA ANALYSIS & TIER 1 INTELLIGENCE
 # ==============================================================================
-def run_full_analysis(db_path):
+def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=85.0):
     conn = sqlite3.connect(db_path)
     sitemap_pages_set = set([r[0] for r in conn.execute("SELECT url FROM sitemaps")])
     
@@ -737,30 +1016,69 @@ def run_full_analysis(db_path):
     df_links_internal = df_links[df_links['In Scope'] == 1].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame(columns=['source', 'destination', 'anchor', 'nofollow'])
     df_links_external = df_links[df_links['In Scope'] == 0].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame(columns=['source', 'destination', 'anchor', 'nofollow'])
 
+    # 1. Internal Link Count Calculation
     if not df_internal.empty and not df_links_internal.empty:
         df_internal['__norm'] = df_internal['Address'].apply(normalize_url)
         unique_inlinks = df_links_internal.groupby('destination')['source'].nunique()
         total_inlinks = df_links_internal['destination'].value_counts()
         df_internal['Unique Inlinks'] = df_internal['__norm'].map(unique_inlinks).fillna(0).astype(int)
         df_internal['Total Inlinks'] = df_internal['__norm'].map(total_inlinks).fillna(0).astype(int)
-        df_internal.drop(columns=['__norm'], inplace=True)
     elif not df_internal.empty:
+        df_internal['__norm'] = df_internal['Address'].apply(normalize_url)
         df_internal['Unique Inlinks'] = 0
         df_internal['Total Inlinks'] = 0
 
-    hreflang_issues = 0
-    if not df_internal.empty and 'Hreflang Tags' in df_internal.columns:
-        crawled_urls = set(df_internal['Address'].apply(normalize_url))
-        def count_missing_hreflang(tags_json):
-            if not tags_json: return 0
-            try:
-                pairs = json.loads(tags_json)
-                return sum(1 for _, href in pairs if normalize_url(href) not in crawled_urls)
-            except:
-                return 0
-        df_internal['Missing Return Hreflang'] = df_internal['Hreflang Tags'].apply(count_missing_hreflang)
-        hreflang_issues = df_internal['Missing Return Hreflang'].sum()
+    # 2. Internal PageRank Computation
+    pr_raw, pr_score, pr_percentile = calculate_internal_pagerank(df_internal, df_links_internal, damping=pr_damping)
+    if not df_internal.empty:
+        df_internal['Internal PageRank'] = df_internal['__norm'].map(pr_raw).fillna(0.0)
+        df_internal['PageRank Score'] = df_internal['__norm'].map(pr_score).fillna(0.0)
+        df_internal['PageRank Percentile'] = df_internal['__norm'].map(pr_percentile).fillna(0.0)
 
+    # 3. Link Equity Waste & Sinkhole Identification
+    df_equity_sinkholes = pd.DataFrame()
+    if not df_internal.empty:
+        high_equity_mask = df_internal['PageRank Percentile'] >= 70.0
+        broken_mask = df_internal['Status Code'] >= 400
+        redirect_mask = df_internal['Status Code'].isin([301, 302, 307, 308])
+        non_indexable_mask = (df_internal['Indexability'] == 'Non-Indexable') & (df_internal['Status Code'] == 200)
+        
+        sinkhole_mask = high_equity_mask & (broken_mask | redirect_mask | non_indexable_mask)
+        if sinkhole_mask.any():
+            df_equity_sinkholes = df_internal[sinkhole_mask][[
+                'Address', 'Status Code', 'Indexability', 'Indexability Reason',
+                'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth'
+            ]].sort_values('PageRank Score', ascending=False)
+
+    # 4. SimHash Near-Duplicate Detection
+    near_dup_records = []
+    if not df_internal.empty and 'SimHash' in df_internal.columns:
+        pages_with_hash = df_internal[df_internal['SimHash'] > 0][['Address', 'Title 1', 'SimHash', 'Word Count', 'Status Code']]
+        pages_with_hash = pages_with_hash[pages_with_hash['Status Code'] == 200].to_dict('records')
+        
+        for i in range(len(pages_with_hash)):
+            for j in range(i + 1, len(pages_with_hash)):
+                p1, p2 = pages_with_hash[i], pages_with_hash[j]
+                sim = simhash_similarity(p1['SimHash'], p2['SimHash'])
+                if sim >= simhash_threshold:
+                    near_dup_records.append({
+                        "Page A": p1['Address'],
+                        "Page B": p2['Address'],
+                        "Similarity (%)": sim,
+                        "Title A": p1['Title 1'][:80],
+                        "Title B": p2['Title 1'][:80],
+                        "Words A": p1['Word Count'],
+                        "Words B": p2['Word Count'],
+                        "Severity": "Critical" if sim >= 95.0 else "High"
+                    })
+    df_near_duplicates = pd.DataFrame(near_dup_records)
+    if not df_near_duplicates.empty:
+        df_near_duplicates = df_near_duplicates.sort_values('Similarity (%)', ascending=False)
+
+    # 5. Hreflang Validation Matrix
+    df_hreflang_matrix, hreflang_issues_count = validate_hreflang_matrix(df_internal)
+
+    # 6. Exact Duplicates
     df_duplicates = pd.DataFrame()
     spa_shell_count = 0
     if not df_internal.empty:
@@ -786,11 +1104,29 @@ def run_full_analysis(db_path):
         if not dup_hashes.empty and dup_hashes.iloc[0] > (len(df_200) * 0.75) and len(df_200) >= 5:
             spa_shell_count = int(dup_hashes.iloc[0])
 
+    # 7. GSC Data Fusion Integration
+    df_gsc_fusion = pd.DataFrame()
+    gsc_at_risk_count = 0
+    if gsc_df is not None and not gsc_df.empty and not df_internal.empty:
+        df_internal['__norm_gsc'] = df_internal['Address'].apply(lambda u: normalize_url(u, strip_trailing_slash=True, strip_www=True))
+        df_gsc_merged = pd.merge(df_internal, gsc_df, on='__norm_gsc', how='inner')
+        if not df_gsc_merged.empty:
+            df_gsc_fusion = df_gsc_merged[[
+                'Address', 'Status Code', 'Indexability', 'Indexability Reason',
+                'GSC_Clicks', 'GSC_Impressions', 'GSC_CTR', 'GSC_Position',
+                'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth', 'Title 1'
+            ]].sort_values('GSC_Clicks', ascending=False)
+            
+            at_risk_mask = (df_gsc_fusion['GSC_Clicks'] > 0) & ((df_gsc_fusion['Status Code'] >= 400) | (df_gsc_fusion['Indexability'] == 'Non-Indexable'))
+            gsc_at_risk_count = int(at_risk_mask.sum())
+        df_internal.drop(columns=['__norm_gsc'], errors='ignore', inplace=True)
+
+    # 8. Orphan URLs
     crawled_urls = set(df_internal['Address'].apply(normalize_url)) if not df_internal.empty else set()
     orphan_pages = sitemap_pages_set - crawled_urls
     df_orphans = pd.DataFrame([{"Address": u, "Type": "In sitemap, not reached by crawl"} for u in sorted(orphan_pages)]) if orphan_pages else pd.DataFrame(columns=['Address', 'Type'])
 
-    # Architectural Fix 3: Complete Issues Summary Aggregation
+    # 9. Complete Issues Summary Aggregation
     issues = []
     def add_issue(cat, sev, count, desc):
         if count > 0:
@@ -799,9 +1135,15 @@ def run_full_analysis(db_path):
     if not df_internal.empty:
         parsed = df_internal[(df_internal['Status Code'] == 200) & (df_internal['Word Count'] > 0)]
         
-        # Architecture & Status Issues
+        # Architecture & Graph Issues
         if spa_shell_count > 0:
             add_issue("Architecture", "Critical", spa_shell_count, "Client-Side Rendered (SPA) Shell Detected — Routes return identical raw HTML shell")
+        if not df_equity_sinkholes.empty:
+            add_issue("Link Equity", "Critical", len(df_equity_sinkholes), "PageRank Equity Sinkholes (High PageRank to Non-Indexable/Broken/Redirected URLs)")
+        if gsc_at_risk_count > 0:
+            add_issue("Traffic Risk", "Critical", gsc_at_risk_count, "High Organic Traffic Pages at Risk (GSC Clicked Pages Returning 4xx/5xx/Noindex)")
+
+        # Status & Response Issues
         add_issue("Status", "Critical", (df_internal['Status Code'] >= 500).sum(), "5xx Server Errors")
         add_issue("Status", "Critical", (df_internal['Status Code'] == 404).sum(), "404 Not Found Pages")
         add_issue("Status", "High", (df_internal['Status Code'].isin([301, 308])).sum(), "Permanent Redirects (301/308)")
@@ -812,6 +1154,10 @@ def run_full_analysis(db_path):
             dest_statuses = df_links_internal['destination'].map(status_map).fillna(0)
             broken_int_links_count = int((dest_statuses >= 400).sum())
             add_issue("Links", "High", broken_int_links_count, "Broken Internal Links (4xx/5xx Destination)")
+
+        # Near-Duplicates (SimHash)
+        if not df_near_duplicates.empty:
+            add_issue("Content", "High", len(df_near_duplicates), f"Near-Duplicate Content Pairs (SimHash Similarity ≥ {simhash_threshold}%)")
 
         # Title Tag Issues
         add_issue("Titles", "High", (parsed['Title Status'] == 'Missing').sum(), "Missing Title Tags")
@@ -830,7 +1176,7 @@ def run_full_analysis(db_path):
         add_issue("Headings", "High", parsed.get('Duplicate H1', pd.Series()).sum(), "Duplicate H1 Tags")
 
         # Content Issues
-        add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content (Hash Match)")
+        add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content (MD5 Exact Match)")
         add_issue("Content", "Medium", (parsed['Word Count'] < 200).sum(), "Thin Content (<200 words)")
         
         # Canonical Issues
@@ -838,14 +1184,14 @@ def run_full_analysis(db_path):
         add_issue("Canonical", "Medium", (parsed['Canonical Match'] == 'Different').sum(), "Canonicalized to a Different URL")
         
         # Hreflang Issues
-        add_issue("Hreflang", "High", hreflang_issues, "Missing Return Hreflang Link")
+        add_issue("Hreflang", "High", hreflang_issues_count, "Hreflang Validation Errors (Missing Return Tag, Invalid ISO Code, or Missing Self-Ref)")
 
-    # Image Issues (Missing Alt & Payload Size > 100 KB)
+    # Image Issues
     if not df_images.empty:
         missing_alt_count = int((df_images['Alt Text'].isin(['(Missing)', '', None]) | df_images['Alt Text'].isna()).sum())
         oversized_images_count = int((df_images['Size (KB)'] > 100).sum())
         add_issue("Images", "Medium", missing_alt_count, "Images Missing Alt Text")
-        add_issue("Images", "Medium", oversized_images_count, "Images Over 100 KB (Unoptimized)")
+        add_issue("Images", "Medium", oversized_images_count, "Images Over 100 KB (Unoptimized Payload)")
 
     df_issues = pd.DataFrame(issues) if issues else pd.DataFrame(columns=['Category', 'Severity', 'Count', 'Description'])
     if not df_issues.empty:
@@ -853,11 +1199,17 @@ def run_full_analysis(db_path):
         df_issues['__sort'] = df_issues['Severity'].map(severity_order)
         df_issues = df_issues.sort_values(['__sort', 'Count'], ascending=[True, False]).drop(columns=['__sort'])
 
+    df_internal.drop(columns=['__norm'], errors='ignore', inplace=True)
     conn.close()
+    
     return {
         "Issues Summary": df_issues,
         "Internal Pages": df_internal,
-        "Duplicates": df_duplicates if not df_duplicates.empty else pd.DataFrame(columns=['Duplicate Type', 'Value', 'Count']),
+        "PageRank & Equity": df_equity_sinkholes if not df_equity_sinkholes.empty else pd.DataFrame(columns=['Address', 'Status Code', 'Indexability', 'PageRank Score', 'Unique Inlinks']),
+        "Near Duplicates (SimHash)": df_near_duplicates if not df_near_duplicates.empty else pd.DataFrame(columns=['Page A', 'Page B', 'Similarity (%)', 'Severity']),
+        "Hreflang Matrix": df_hreflang_matrix if not df_hreflang_matrix.empty else pd.DataFrame(columns=['Source URL', 'Hreflang Code', 'Target URL', 'Return Tag Status', 'ISO Validation']),
+        "GSC Performance Fusion": df_gsc_fusion if not df_gsc_fusion.empty else pd.DataFrame(columns=['Address', 'GSC_Clicks', 'GSC_Impressions', 'Status Code', 'PageRank Score']),
+        "Duplicates (Exact)": df_duplicates if not df_duplicates.empty else pd.DataFrame(columns=['Duplicate Type', 'Value', 'Count']),
         "Internal Links": df_links_internal,
         "External Links": df_links_external,
         "Images": df_images if not df_images.empty else pd.DataFrame(columns=['address', 'Alt Text', 'Size (KB)', 'Parent Page', 'loading']),
@@ -866,7 +1218,7 @@ def run_full_analysis(db_path):
     }
 
 # ==============================================================================
-# 6. IN-MEMORY EXCEL EXPORTER
+# 6. MULTI-TAB IN-MEMORY EXCEL EXPORTER
 # ==============================================================================
 def create_excel_report(data_dict):
     output = BytesIO()
@@ -884,14 +1236,15 @@ def create_excel_report(data_dict):
     return output
 
 # ==============================================================================
-# 7. STREAMLIT APPLICATION INTERFACE
+# 7. STREAMLIT ENTERPRISE AUDITOR INTERFACE
 # ==============================================================================
-st.set_page_config(page_title="SEO-Diver Auditor", page_icon="🕷️", layout="wide")
+st.set_page_config(page_title="SEO-Diver Enterprise Auditor", page_icon="🕷️", layout="wide")
 
-st.title("🕷️ SEO-Diver Technical Auditor")
-st.caption("Automated technical SEO crawler, duplicate content analyzer, and indexability engine.")
+st.title("🕷️ SEO-Diver Technical Auditor — Enterprise Tier 1")
+st.caption("Enterprise technical SEO crawler: Internal PageRank modeling, SimHash near-duplicate clustering, Hreflang reciprocity matrix, and Google Search Console performance data fusion.")
 
-st.sidebar.header("Crawl Parameters")
+# Sidebar Configuration
+st.sidebar.header("🎯 Crawl Parameters")
 start_url = st.sidebar.text_input("Start URL", "https://www.example.com/").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
     start_url = 'https://' + start_url
@@ -904,9 +1257,9 @@ scope_mode = st.sidebar.selectbox(
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
-    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=20000, value=250, step=50)
+    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=50000, value=250, step=50)
 with col_b:
-    concurrency = st.slider("Concurrency", min_value=1, max_value=16, value=6)
+    concurrency = st.slider("Concurrency", min_value=1, max_value=24, value=8)
 
 ua_choice = st.sidebar.selectbox(
     "User-Agent Identity",
@@ -919,10 +1272,27 @@ ua_map = {
 }
 chosen_ua = ua_map[ua_choice]
 
-stealth_jitter = st.sidebar.toggle("Enable Stealth Jitter (Anti-WAF)", value=True)
-respect_robots = st.sidebar.toggle("Respect robots.txt", value=False)
+# Advanced Tier 1 Settings Accordion
+with st.sidebar.expander("⚙️ Tier 1 Advanced Algorithms", expanded=False):
+    pr_damping = st.slider("PageRank Damping Factor", min_value=0.50, max_value=0.95, value=0.85, step=0.05)
+    simhash_threshold = st.slider("SimHash Duplicate Threshold (%)", min_value=70, max_value=98, value=85, step=1)
+    stealth_jitter = st.toggle("Enable Stealth Jitter (Anti-WAF)", value=True)
+    respect_robots = st.toggle("Respect robots.txt", value=False)
 
-start_crawl_button = st.sidebar.button("🚀 Start SEO Audit", type="primary", use_container_width=True)
+# Google Search Console Upload
+st.sidebar.markdown("---")
+st.sidebar.subheader("📈 Google Search Console (GSC)")
+gsc_file = st.sidebar.file_uploader("Upload GSC Pages.csv", type=["csv", "txt"], help="Upload an exported Pages.csv from Google Search Console to correlate organic traffic with technical health.")
+
+gsc_data = None
+if gsc_file is not None:
+    gsc_data = parse_gsc_performance_data(gsc_file)
+    if not gsc_data.empty:
+        st.sidebar.success(f"✓ Ingested {len(gsc_data):,} GSC URLs")
+    else:
+        st.sidebar.error("Could not parse GSC CSV format.")
+
+start_crawl_button = st.sidebar.button("🚀 Run Enterprise Audit", type="primary", use_container_width=True)
 
 if start_crawl_button:
     parsed_base = urlparse(start_url)
@@ -953,7 +1323,7 @@ if start_crawl_button:
         "db_path": temp_db
     }
 
-    status_box = st.status("Initializing SEO Crawler...", expanded=True)
+    status_box = st.status("Initializing Enterprise SEO Crawler...", expanded=True)
     prog_bar = status_box.progress(0.0)
     metrics_placeholder = status_box.empty()
     stats_placeholder = status_box.empty()
@@ -973,21 +1343,22 @@ if start_crawl_button:
     finally:
         loop.close()
 
-    status_box.update(label="Crawling Complete! Analyzing data...", state="running")
-    results = run_full_analysis(temp_db)
-    status_box.update(label="✅ Audit Complete!", state="complete", expanded=False)
+    status_box.update(label="Crawling Complete! Computing Graph PageRank & SimHash...", state="running")
+    results = run_full_analysis(temp_db, gsc_df=gsc_data, pr_damping=pr_damping, simhash_threshold=simhash_threshold)
+    status_box.update(label="✅ Enterprise Audit Complete!", state="complete", expanded=False)
 
     st.session_state['audit_results'] = results
     st.session_state['audit_url'] = final_target_host
 
+# Render Dashboard
 if 'audit_results' in st.session_state:
     res = st.session_state['audit_results']
     host = st.session_state['audit_url']
 
-    st.subheader(f"Audit Dashboard: {host}")
+    st.subheader(f"📊 Audit Dashboard: {host}")
 
     df_int = res['Internal Pages']
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
     with kpi1:
         st.metric("Total Crawled Pages", len(df_int))
     with kpi2:
@@ -997,23 +1368,30 @@ if 'audit_results' in st.session_state:
         broken_count = (df_int['Status Code'] >= 400).sum() if not df_int.empty else 0
         st.metric("4xx/5xx Errors", int(broken_count))
     with kpi4:
-        dup_count = df_int['Duplicate Title'].sum() if ('Duplicate Title' in df_int.columns) else 0
-        st.metric("Duplicate Titles", int(dup_count))
+        sinkholes_count = len(res['PageRank & Equity']) if not res['PageRank & Equity'].empty else 0
+        st.metric("PageRank Sinkholes", int(sinkholes_count))
+    with kpi5:
+        near_dups_count = len(res['Near Duplicates (SimHash)']) if not res['Near Duplicates (SimHash)'].empty else 0
+        st.metric("Near-Duplicate Pairs", int(near_dups_count))
 
     excel_file = create_excel_report(res)
     st.download_button(
-        label="📥 Download Full Excel Workbook (.xlsx)",
+        label="📥 Download Enterprise Excel Workbook (.xlsx)",
         data=excel_file,
-        file_name=f"technical_seo_audit_{host}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        file_name=f"enterprise_seo_audit_{host}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary"
     )
 
-    tab_issues, tab_internal, tab_duplicates, tab_links, tab_images, tab_orphans, tab_errors = st.tabs([
+    tab_issues, tab_internal, tab_pagerank, tab_simhash, tab_hreflang, tab_gsc, tab_duplicates, tab_links, tab_images, tab_orphans, tab_errors = st.tabs([
         "⚠️ Issues Summary",
         "📄 Internal Pages",
-        "👥 Duplicates",
-        "🔗 Internal Links",
+        "📊 PageRank & Equity",
+        "🧬 Near-Duplicates",
+        "🌐 Hreflang Matrix",
+        "📈 GSC Fusion",
+        "👥 Exact Duplicates",
+        "🔗 Links",
         "🖼️ Images",
         "👤 Orphan Pages",
         "🚨 Crawl Errors"
@@ -1027,30 +1405,83 @@ if 'audit_results' in st.session_state:
 
     with tab_internal:
         if not df_int.empty:
-            cols_to_show = ['Address', 'Status Code', 'Indexability', 'Indexability Reason', 'Title 1', 'Word Count', 'SPA App Shell', 'Canonical Match', 'TTFB (s)']
+            cols_to_show = [
+                'Address', 'Status Code', 'Indexability', 'Indexability Reason',
+                'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth',
+                'Title 1', 'Word Count', 'Canonical Match', 'TTFB (s)'
+            ]
             st.dataframe(df_int[[c for c in cols_to_show if c in df_int.columns]], use_container_width=True)
 
-    with tab_duplicates:
-        if not res['Duplicates'].empty:
-            st.dataframe(res['Duplicates'], use_container_width=True, hide_index=True)
+    with tab_pagerank:
+        st.markdown("### 📊 Internal PageRank & Link Equity Distribution")
+        st.caption("Measures how internal link equity flows through the website topology. Highlights **PageRank Sinkholes** (high link equity wasted on broken or non-indexable URLs).")
+        
+        if not df_int.empty and 'PageRank Score' in df_int.columns:
+            col_pr1, col_pr2 = st.columns(2)
+            with col_pr1:
+                st.markdown("#### 🏆 Top 15 Highest PageRank Pages")
+                top_pr = df_int.sort_values('PageRank Score', ascending=False)[[
+                    'Address', 'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth', 'Indexability'
+                ]].head(15)
+                st.dataframe(top_pr, use_container_width=True, hide_index=True)
+                
+            with col_pr2:
+                st.markdown("#### 🚨 Top Link Equity Sinkholes")
+                if not res['PageRank & Equity'].empty:
+                    st.dataframe(res['PageRank & Equity'].head(15), use_container_width=True, hide_index=True)
+                else:
+                    st.success("Zero Link Equity Sinkholes detected! Internal equity is distributed cleanly.")
+
+    with tab_simhash:
+        st.markdown("### 🧬 SimHash 64-bit Near-Duplicate Content Clusters")
+        st.caption(f"Identifies pages with body content similarity ≥ {simhash_threshold}% (e.g. faceted products, regional duplicate pages, thin variants).")
+        if not res['Near Duplicates (SimHash)'].empty:
+            st.dataframe(res['Near Duplicates (SimHash)'], use_container_width=True, hide_index=True)
         else:
-            st.info("No duplicate content or titles identified.")
+            st.success("Zero near-duplicate content pairs identified.")
+
+    with tab_hreflang:
+        st.markdown("### 🌐 Multi-Lingual Hreflang Validation Matrix")
+        st.caption("Audits reciprocal return tags, self-referential tags, and ISO 639-1 / ISO 3166-1 syntax conformance.")
+        if not res['Hreflang Matrix'].empty:
+            st.dataframe(res['Hreflang Matrix'], use_container_width=True, hide_index=True)
+        else:
+            st.info("No hreflang tags found on crawled pages.")
+
+    with tab_gsc:
+        st.markdown("### 📈 Google Search Console (GSC) Performance Fusion")
+        st.caption("Correlates real-world Google organic search traffic (Clicks, Impressions, CTR, Position) with crawler indexability and PageRank.")
+        if not res['GSC Performance Fusion'].empty:
+            st.dataframe(res['GSC Performance Fusion'], use_container_width=True, hide_index=True)
+        else:
+            st.info("Upload a Google Search Console `Pages.csv` export in the sidebar to view organic performance fusion.")
+
+    with tab_duplicates:
+        st.markdown("### 👥 Exact MD5 Duplicates")
+        if not res['Duplicates (Exact)'].empty:
+            st.dataframe(res['Duplicates (Exact)'], use_container_width=True, hide_index=True)
+        else:
+            st.info("No exact duplicate content or titles identified.")
 
     with tab_links:
+        st.markdown("### 🔗 Internal Links Graph")
         if not res['Internal Links'].empty:
             st.dataframe(res['Internal Links'].head(1000), use_container_width=True)
 
     with tab_images:
+        st.markdown("### 🖼️ Image Assets & Payloads")
         if not res['Images'].empty:
             st.dataframe(res['Images'].head(1000), use_container_width=True)
 
     with tab_orphans:
+        st.markdown("### 👤 Orphan Pages (In Sitemap but Not Crawled)")
         if not res['Orphan Pages'].empty:
             st.dataframe(res['Orphan Pages'], use_container_width=True, hide_index=True)
         else:
             st.success("Zero orphan URLs detected.")
 
     with tab_errors:
+        st.markdown("### 🚨 Crawl & Network Errors")
         if not res['Crawl Errors'].empty:
             st.dataframe(res['Crawl Errors'], use_container_width=True, hide_index=True)
         else:
