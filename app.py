@@ -10,9 +10,11 @@ import asyncio
 import hashlib
 import tempfile
 import warnings
+import threading
+from queue import Queue, Empty
 from io import BytesIO
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, urlunparse, urldefrag
+from urllib.parse import urljoin, urlparse, urlunparse, urldefrag, parse_qsl, urlencode
 from urllib.robotparser import RobotFileParser
 from collections import deque, defaultdict, Counter
 
@@ -20,8 +22,11 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import psutil
+from openpyxl import Workbook
+from openpyxl.cell.cell import WriteOnlyCell
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
-# Optional feature imports
 try:
     import tldextract
     HAS_TLDEXTRACT = True
@@ -51,7 +56,7 @@ RE_META_DESCRIPTION = re.compile(r'^description$', re.I)
 RE_META_ROBOTS = re.compile(r'^(googlebot|bingbot|robots)$', re.I)
 RE_LINK_CANONICAL = re.compile(r'<([^>]+)>;\s*rel="?canonical"?', re.I)
 RE_SCRIPT_LDJSON = re.compile(r'ld\+json', re.I)
-RE_LANG_CODE = re.compile(r'^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$')
+RE_SPA_MOUNT = re.compile(r'^(root|app|__next)$', re.I)
 BOILERPLATE_CLASS_PATTERN = re.compile(
     r'\b(nav|navigation|menu|footer|header|sidebar|breadcrumb|cookie|banner|topbar|bottombar|site-header|site-footer|main-menu|main-nav|skip-link)\b',
     re.IGNORECASE
@@ -71,7 +76,7 @@ def extract_registered_domain(netloc):
     parts = netloc.split('.')
     return ".".join(parts[-2:]).lower() if len(parts) >= 2 else netloc.lower()
 
-def normalize_url(url: str) -> str:
+def normalize_url(url: str, strip_trailing_slash: bool = False) -> str:
     try:
         url, _ = urldefrag(url)
         p = urlparse(url)
@@ -83,7 +88,17 @@ def normalize_url(url: str) -> str:
             netloc = f"{hostname}:{port}"
         path = p.path or '/'
         path = re.sub(r'/{2,}', '/', path)
-        return urlunparse((p.scheme.lower(), netloc, path, p.params, p.query, ''))
+        if strip_trailing_slash and len(path) > 1 and path.endswith('/'):
+            path = path.rstrip('/')
+        
+        # Sort query params to prevent distinct URLs for out-of-order params
+        query = p.query
+        if query:
+            qsl = parse_qsl(query, keep_blank_values=True)
+            qsl.sort()
+            query = urlencode(qsl)
+            
+        return urlunparse((p.scheme.lower(), netloc, path, p.params, query, ''))
     except Exception:
         return url
 
@@ -121,6 +136,11 @@ def extract_images(soup, base):
                 })
     return images
 
+def sanitize_excel(val):
+    if isinstance(val, str) and val.startswith(('=', '+', '-', '@')):
+        return "'" + val
+    return val
+
 class ResponseShim:
     def __init__(self, status_code, url, headers, content, history=None):
         self.status_code = status_code
@@ -149,10 +169,9 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "H1-1": "", "H1 Count": 0, "H2 Count": 0, "H3 Count": 0, "H2-1": "", "H3-1": "",
         "Hreflang Tags": "", "Hreflang Count": 0,
         "Canonical Link": "", "Canonical Count": 0, "Canonical Match": "N/A", "Canonical In Scope": "N/A",
-        "Pagination rel=next": "", "Pagination rel=prev": "",
         "Lang Attribute": "", "Viewport Meta": "", "Charset": "",
         "Redirect Chain": "None", "Redirect Hops": 0, "Has Redirect Loop": "No",
-        "Word Count": 0, "Text/HTML Ratio (%)": 0,
+        "Word Count": 0, "Text/HTML Ratio (%)": 0, "SPA App Shell": "No",
         "Internal Outlinks": 0, "External Outlinks": 0, "Nofollow Outlinks": 0,
         "Size (KB)": 0, "TTFB (s)": 0, "Content Hash": "", "Last-Modified": "", "ETag": "",
     }
@@ -175,6 +194,11 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         row["Redirect Hops"] = len(resp.history)
         if len(set([h.url for h in resp.history] + [resp.url])) < len(resp.history) + 1:
             row["Has Redirect Loop"] = "Yes"
+        if len(resp.history) > 5:
+            row["Has Redirect Loop"] = "Yes (Exceeded 5 hops)"
+            row["Indexability"] = "Error"
+            row["Indexability Reason"] = "Redirect Loop (>5 hops)"
+            return row, [], []
 
     if row["Status Code"] in (301, 302, 303, 307, 308):
         row["Indexability"] = "Redirected"
@@ -239,16 +263,20 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     canons = soup.find_all('link', rel=lambda x: x and 'canonical' in (x if isinstance(x, str) else ' '.join(x)).lower())
     canon_seen = set()
     if http_canon:
-        canon_seen.add(normalize_url(http_canon))
+        canon_seen.add(normalize_url(http_canon, strip_trailing_slash=True))
     for c in canons:
         href = c.get('href', '').strip()
         if href:
-            canon_seen.add(normalize_url(urljoin(resp.url, href)))
+            canon_seen.add(normalize_url(urljoin(resp.url, href), strip_trailing_slash=True))
     row["Canonical Count"] = len(canon_seen)
     canon_link = http_canon or (urljoin(resp.url, canons[0].get('href', '').strip()) if canons and canons[0].get('href', '').strip() else "")
     row["Canonical Link"] = canon_link
+    
+    # Path-normalized canonical matching
     if canon_link:
-        row["Canonical Match"] = "Self" if normalize_url(canon_link) == normalize_url(resp.url) else "Different"
+        norm_canon = normalize_url(canon_link, strip_trailing_slash=True)
+        norm_resp = normalize_url(resp.url, strip_trailing_slash=True)
+        row["Canonical Match"] = "Self" if norm_canon == norm_resp else "Different"
         row["Canonical In Scope"] = "Yes" if is_in_scope_fn(canon_link) else "No"
 
     directives = {d.strip().lower() for d in re.split(r'[,\s]+', row["Meta Robots"] + ',' + row["X-Robots-Tag"]) if d.strip()}
@@ -256,7 +284,7 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     if 'noindex' in directives or 'none' in directives:
         reasons.append("noindex directive")
     if row["Canonical Match"] == "Different":
-        reasons.append("canonicalized elsewhere")
+        reasons.append(f"canonicalized to {row['Canonical Link']}")
     row["Indexability"] = "Non-Indexable" if reasons else "Indexable"
     row["Indexability Reason"] = "; ".join(reasons)
 
@@ -341,6 +369,11 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     visible_target = main if main else soup
     body_text = visible_target.get_text(separator=' ', strip=True)
     row["Word Count"] = len(body_text.split())
+    
+    # SPA Detection
+    if row["Word Count"] < 100 and soup.find(id=RE_SPA_MOUNT):
+        row["SPA App Shell"] = "Yes"
+        
     if len(resp.content) > 100:
         row["Text/HTML Ratio (%)"] = round(len(body_text) / len(resp.content) * 100, 2)
 
@@ -414,6 +447,7 @@ def discover_sitemaps(session, base_url, target_netloc, root_domain, is_in_scope
                 loc = u.find('loc') if u.name == 'url' else u
                 if loc and loc.text and loc.text.strip().startswith('http'):
                     all_urls.add(loc.text.strip())
+            del soup
         except Exception:
             continue
 
@@ -425,12 +459,12 @@ def discover_sitemaps(session, base_url, target_netloc, root_domain, is_in_scope
     return sitemap_pages
 
 # ==============================================================================
-# 4. ASYNC CRAWLER ENGINE
+# 4. ASYNC CRAWLER & IMAGE SIZER ENGINE
 # ==============================================================================
 RETRY_STATUSES = {429, 503, 520, 522, 524}
 MAX_RETRIES = 3
 
-async def execute_crawl(config, progress_callback, status_text_callback):
+async def execute_crawl(config, update_queue, stop_event):
     base_url = config['base_url']
     target_hostname = config['target_hostname']
     root_domain = config['root_domain']
@@ -443,7 +477,7 @@ async def execute_crawl(config, progress_callback, status_text_callback):
     headers = config['headers']
     db_path = config['db_path']
 
-    # Initial pre-flight probe: resolve apex/www redirects
+    # Initial pre-flight probe: resolve domain canonicals
     try:
         with requests.Session() as s:
             s.headers.update(headers)
@@ -468,27 +502,32 @@ async def execute_crawl(config, progress_callback, status_text_callback):
         if scope_mode == "Root Domain & Subdomains":
             return extract_registered_domain(hostname) == root_domain
         if scope_mode == "This Subdomain Only":
-            return hostname == target_hostname or hostname.replace("www.", "") == target_hostname.replace("www.", "")
+            return hostname == target_hostname
         if scope_mode == "This Subfolder Only":
-            matches_host = (hostname == target_hostname or hostname.replace("www.", "") == target_hostname.replace("www.", ""))
-            return matches_host and p.path.startswith(base_path)
+            return hostname == target_hostname and p.path.startswith(base_path)
         return False
 
-    conn = sqlite3.connect(db_path)
+    # Setup WAL mode SQLite DB (exclusive to this thread)
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS pages (address TEXT PRIMARY KEY, data TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS links (source TEXT, destination TEXT, anchor TEXT, nofollow INTEGER, in_scope INTEGER)")
     cur.execute("CREATE TABLE IF NOT EXISTS images (address TEXT, alt TEXT, parent_page TEXT, loading TEXT, size_kb REAL)")
     cur.execute("CREATE TABLE IF NOT EXISTS errors (url TEXT, error_type TEXT, message TEXT, ts TEXT)")
-    conn.commit()
-
-    # Discover Sitemaps
-    status_text_callback("🔍 Probing robots.txt and sitemaps...")
+    cur.execute("CREATE TABLE IF NOT EXISTS sitemaps (url TEXT PRIMARY KEY)")
+    
+    update_queue.put({"status": "🔍 Probing robots.txt and sitemaps..."})
     with requests.Session() as s:
         s.headers.update(headers)
         sitemap_pages = discover_sitemaps(s, base_url, target_hostname, root_domain, is_in_scope)
+        
+    cur.execute("BEGIN TRANSACTION")
+    cur.executemany("INSERT OR IGNORE INTO sitemaps VALUES (?)", [(u,) for u in sitemap_pages])
+    cur.execute("COMMIT")
 
-    # Robots parser
     robots_parser = RobotFileParser()
     if respect_robots:
         try:
@@ -519,7 +558,6 @@ async def execute_crawl(config, progress_callback, status_text_callback):
                 await asyncio.sleep(delay - elapsed)
             host_last_req[host] = time.time()
 
-    # SSL context configured to bypass verification without disabling TLS transport
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -528,9 +566,12 @@ async def execute_crawl(config, progress_callback, status_text_callback):
         host = urlparse(url).hostname or target_hostname
         last_status = None
         for attempt in range(MAX_RETRIES + 1):
+            if stop_event.is_set():
+                return None, None, None, Exception("Stopped by user")
             await polite_delay(host)
             start = time.time()
             try:
+                # Add support for brotli compression gracefully via aiohttp
                 async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=True, ssl=ssl_ctx) as resp:
                     if resp.status in RETRY_STATUSES and attempt < MAX_RETRIES:
                         last_status = resp.status
@@ -541,6 +582,10 @@ async def execute_crawl(config, progress_callback, status_text_callback):
                     shim = ResponseShim(resp.status, str(resp.url), {k.lower(): v for k, v in resp.headers.items()}, content, hist)
                     row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
                     row["TTFB (s)"] = round(time.time() - start, 3)
+                    
+                    # Dereference immediately to limit memory build up
+                    del shim
+                    del content
                     return row, links, images, None
             except Exception as e:
                 if attempt < MAX_RETRIES:
@@ -553,12 +598,14 @@ async def execute_crawl(config, progress_callback, status_text_callback):
         row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
         return row, links, images, None
 
-    connector = aiohttp.TCPConnector(limit=concurrency * 2, force_close=True, ssl=ssl_ctx)
+    # Connection pooling with strict limits to prevent socket exhaustion
+    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, force_close=False, ssl=ssl_ctx, ttl_dns_cache=300, keepalive_timeout=60)
     pages_counted, processed, error_count = 0, 0, 0
     fetch_ceiling = crawl_limit * 3
+    start_time_crawl = time.time()
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as aio_session:
-        while queue and pages_counted < crawl_limit and processed < fetch_ceiling:
+        while queue and pages_counted < crawl_limit and processed < fetch_ceiling and not stop_event.is_set():
             batch = []
             while queue and len(batch) < concurrency and pages_counted < crawl_limit:
                 url, depth = queue.popleft()
@@ -577,7 +624,12 @@ async def execute_crawl(config, progress_callback, status_text_callback):
             tasks = [fetch_async(aio_session, u, d) for u, d in batch]
             results = await asyncio.gather(*tasks)
 
-            for (url, depth), (row, links, images, exc) in zip(batch, results):
+            # Batch DB Operations
+            cur.execute("BEGIN TRANSACTION")
+            for (url, depth), res_tuple in zip(batch, results):
+                if res_tuple[0] is None:
+                    continue # Stopped mid-flight
+                row, links, images, exc = res_tuple
                 cur.execute("INSERT OR REPLACE INTO pages VALUES (?, ?)", (row['Address'], json.dumps(row, default=str)))
                 if links:
                     cur.executemany("INSERT INTO links VALUES (?,?,?,?,?)", [(r['source'], r['destination'], r['anchor'], int(r['nofollow']), int(r['in_scope'])) for r in links])
@@ -600,17 +652,67 @@ async def execute_crawl(config, progress_callback, status_text_callback):
                 processed += 1
                 if row.get('Indexability') != 'Redirected':
                     pages_counted += 1
-                progress_callback(min(pages_counted / crawl_limit, 1.0), pages_counted, processed, len(queue))
-            conn.commit()
+                
+                # Metric calculations
+                elapsed = max(0.1, time.time() - start_time_crawl)
+                speed = round(processed / elapsed, 1)
+                mem = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+                update_queue.put({
+                    "progress": min(pages_counted / crawl_limit, 1.0),
+                    "pages": pages_counted,
+                    "processed": processed,
+                    "queue_len": len(queue),
+                    "speed": speed,
+                    "mem": mem,
+                    "ttfb": row.get("TTFB (s)", 0.0)
+                })
+            cur.execute("COMMIT")
+
+        if not stop_event.is_set():
+            update_queue.put({"status": "📏 Measuring image payload sizes..."})
+            cur.execute("SELECT DISTINCT address FROM images")
+            img_urls = [r[0] for r in cur.fetchall()]
+            if img_urls:
+                sem = asyncio.Semaphore(15)
+                async def get_img_size(u):
+                    if stop_event.is_set():
+                        return u, 0.0
+                    async with sem:
+                        try:
+                            async with aio_session.head(u, timeout=aiohttp.ClientTimeout(total=8), ssl=ssl_ctx) as r_img:
+                                cl = r_img.headers.get('Content-Length')
+                                if cl and cl.isdigit():
+                                    return u, round(int(cl) / 1024, 2)
+                        except Exception:
+                            pass
+                        return u, 0.0
+
+                img_sizes = await asyncio.gather(*[get_img_size(u) for u in img_urls])
+                cur.execute("BEGIN TRANSACTION")
+                cur.executemany("UPDATE images SET size_kb = ? WHERE address = ?", [(sz, u) for u, sz in img_sizes])
+                cur.execute("COMMIT")
 
     conn.close()
-    return sitemap_pages
+
+def run_crawl_thread(config, update_queue, stop_event):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(execute_crawl(config, update_queue, stop_event))
+    except Exception as e:
+        update_queue.put({"error": str(e)})
+    finally:
+        loop.close()
+        update_queue.put({"done": True})
 
 # ==============================================================================
 # 5. POST-CRAWL DATA ANALYSIS & REPORT GENERATOR
 # ==============================================================================
-def run_full_analysis(db_path, sitemap_pages_set):
+def run_full_analysis(db_path):
     conn = sqlite3.connect(db_path)
+    
+    # Retrieve sitemap pages
+    sitemap_pages_set = set([r[0] for r in conn.execute("SELECT url FROM sitemaps")])
     
     rows = [json.loads(r[0]) for r in conn.execute("SELECT data FROM pages")]
     df_internal = pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -621,7 +723,6 @@ def run_full_analysis(db_path, sitemap_pages_set):
     df_links_internal = df_links[df_links['In Scope'] == 1].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame()
     df_links_external = df_links[df_links['In Scope'] == 0].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame()
 
-    # Inlinks calculation
     if not df_internal.empty and not df_links_internal.empty:
         df_internal['__norm'] = df_internal['Address'].apply(normalize_url)
         unique_inlinks = df_links_internal.groupby('destination')['source'].nunique()
@@ -633,14 +734,27 @@ def run_full_analysis(db_path, sitemap_pages_set):
         df_internal['Unique Inlinks'] = 0
         df_internal['Total Inlinks'] = 0
 
-    # Duplicates detection
+    # Hreflang Reciprocity Check
+    hreflang_issues = 0
+    if not df_internal.empty and 'Hreflang Tags' in df_internal.columns:
+        crawled_urls = set(df_internal['Address'].apply(normalize_url))
+        def count_missing_hreflang(tags_json):
+            if not tags_json: return 0
+            try:
+                pairs = json.loads(tags_json)
+                return sum(1 for _, href in pairs if normalize_url(href) not in crawled_urls)
+            except:
+                return 0
+        df_internal['Missing Return Hreflang'] = df_internal['Hreflang Tags'].apply(count_missing_hreflang)
+        hreflang_issues = df_internal['Missing Return Hreflang'].sum()
+
+    # Duplicates detection across all Status 200 pages
     df_duplicates = pd.DataFrame()
     if not df_internal.empty:
-        idx_mask = df_internal['Indexability'] == 'Indexable'
-        df_idx = df_internal[idx_mask]
-        dup_titles = df_idx[df_idx['Title 1'].astype(bool)]['Title 1'].value_counts()
-        dup_h1s = df_idx[df_idx['H1-1'].astype(bool)]['H1-1'].value_counts()
-        dup_hashes = df_idx[df_idx['Content Hash'].astype(bool)]['Content Hash'].value_counts()
+        df_200 = df_internal[df_internal['Status Code'] == 200]
+        dup_titles = df_200[df_200['Title 1'].astype(bool)]['Title 1'].value_counts()
+        dup_h1s = df_200[df_200['H1-1'].astype(bool)]['H1-1'].value_counts()
+        dup_hashes = df_200[df_200['Content Hash'].astype(bool)]['Content Hash'].value_counts()
 
         df_internal['Duplicate Title'] = df_internal['Title 1'].map(lambda t: dup_titles.get(t, 0) > 1 if t else False)
         df_internal['Duplicate H1'] = df_internal['H1-1'].map(lambda h: dup_h1s.get(h, 0) > 1 if h else False)
@@ -652,9 +766,14 @@ def run_full_analysis(db_path, sitemap_pages_set):
         for h1, cnt in dup_h1s[dup_h1s > 1].items():
             dup_rows.append({"Duplicate Type": "H1", "Value": str(h1)[:120], "Count": int(cnt)})
         for h, cnt in dup_hashes[dup_hashes > 1].items():
-            sample = df_idx[df_idx['Content Hash'] == h]['Title 1'].iloc[0] if not df_idx[df_idx['Content Hash'] == h].empty else ''
+            sample = df_200[df_200['Content Hash'] == h]['Title 1'].iloc[0] if not df_200[df_200['Content Hash'] == h].empty else ''
             dup_rows.append({"Duplicate Type": "Body Content", "Value": f"[{h[:8]}] {sample}"[:120], "Count": int(cnt)})
         df_duplicates = pd.DataFrame(dup_rows)
+
+    # Orphan & Sitemap Reconciliation
+    crawled_urls = set(df_internal['Address'].apply(normalize_url)) if not df_internal.empty else set()
+    orphan_pages = sitemap_pages_set - crawled_urls
+    df_orphans = pd.DataFrame([{"Address": u, "Type": "In sitemap, not reached by crawl"} for u in sorted(orphan_pages)])
 
     # Issues Summary compilation
     issues = []
@@ -672,10 +791,12 @@ def run_full_analysis(db_path, sitemap_pages_set):
         add_issue("Titles", "High", parsed.get('Duplicate Title', pd.Series()).sum(), "Duplicate Titles")
         add_issue("Headings", "High", (parsed['H1 Count'] == 0).sum(), "Missing H1 Tags")
         add_issue("Headings", "Medium", (parsed['H1 Count'] > 1).sum(), "Multiple H1 Tags")
-        add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content")
+        add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content (Hash Match)")
         add_issue("Content", "Medium", (parsed['Word Count'] < 200).sum(), "Thin Content (<200 words)")
+        add_issue("Content", "Medium", (parsed['SPA App Shell'] == 'Yes').sum(), "Client-Side Rendered Shell detected")
         add_issue("Canonical", "High", (parsed['Canonical Count'] > 1).sum(), "Multiple Canonical Tags")
-        add_issue("Canonical", "Medium", (parsed['Canonical Match'] == 'Missing').sum(), "Missing Canonical Tags")
+        add_issue("Canonical", "Medium", (parsed['Canonical Match'] == 'Different').sum(), "Canonicalized to a Different URL")
+        add_issue("Hreflang", "High", hreflang_issues, "Missing Return Hreflang Link")
 
     df_issues = pd.DataFrame(issues)
     if not df_issues.empty:
@@ -685,27 +806,41 @@ def run_full_analysis(db_path, sitemap_pages_set):
 
     conn.close()
     return {
-        "internal": df_internal,
-        "links_internal": df_links_internal,
-        "links_external": df_links_external,
-        "images": df_images,
-        "duplicates": df_duplicates,
-        "issues": df_issues,
-        "errors": df_errors
+        "Issues Summary": df_issues,
+        "Internal Pages": df_internal,
+        "Duplicates": df_duplicates,
+        "Internal Links": df_links_internal,
+        "External Links": df_links_external,
+        "Images": df_images,
+        "Orphan Pages": df_orphans,
+        "Crawl Errors": df_errors
     }
 
 # ==============================================================================
-# 6. IN-MEMORY EXCEL EXPORTER
+# 6. IN-MEMORY EXCEL EXPORTER (STREAMING)
 # ==============================================================================
-def create_excel_report(data_dict):
+def create_excel_report_streaming(data_dict):
+    """
+    Creates an Excel report using chunked generator/WriteOnlyWorksheet to 
+    circumvent OOM kills on massive Pandas DataFrames.
+    Applies formula injection sanitization cell-by-cell.
+    """
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for sheet_name, df in data_dict.items():
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                clean_df = df.copy()
-                for col in clean_df.select_dtypes(include=['object']).columns:
-                    clean_df[col] = clean_df[col].apply(lambda v: v[:32700] if isinstance(v, str) else v)
-                clean_df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    wb = Workbook(write_only=True)
+    
+    for sheet_name, df in data_dict.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            ws = wb.create_sheet(title=sheet_name[:31])
+            # Write Header
+            ws.append(list(df.columns))
+            # Write rows directly
+            for row in df.itertuples(index=False):
+                sanitized_row = [sanitize_excel(val) for val in row]
+                # truncate enormous strings for excel safety
+                sanitized_row = [v[:32700] if isinstance(v, str) else v for v in sanitized_row]
+                ws.append(sanitized_row)
+                
+    wb.save(output)
     output.seek(0)
     return output
 
@@ -717,7 +852,6 @@ st.set_page_config(page_title="SEO-Diver Auditor", page_icon="🕷️", layout="
 st.title("🕷️ SEO-Diver Technical Auditor")
 st.caption("Automated technical SEO crawler, duplicate content analyzer, and indexability engine.")
 
-# Sidebar Configuration
 st.sidebar.header("Crawl Parameters")
 start_url = st.sidebar.text_input("Start URL", "https://example.com").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
@@ -731,7 +865,7 @@ scope_mode = st.sidebar.selectbox(
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
-    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=20000, value=100, step=50)
+    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=20000, value=250, step=50)
 with col_b:
     concurrency = st.slider("Concurrency", min_value=1, max_value=16, value=5)
 
@@ -749,9 +883,19 @@ chosen_ua = ua_map[ua_choice]
 stealth_jitter = st.sidebar.toggle("Enable Stealth Jitter (Anti-WAF)", value=True)
 respect_robots = st.sidebar.toggle("Respect robots.txt", value=False)
 
-start_crawl_button = st.sidebar.button("🚀 Start SEO Audit", type="primary", use_container_width=True)
+# Initialize Session State
+if 'is_crawling' not in st.session_state:
+    st.session_state['is_crawling'] = False
 
-# Main Execution Flow
+start_crawl_button = st.sidebar.button("🚀 Start SEO Audit", type="primary", use_container_width=True, disabled=st.session_state.is_crawling)
+if st.session_state.is_crawling:
+    stop_button = st.sidebar.button("🛑 Stop Crawl", type="secondary", use_container_width=True)
+    if stop_button:
+        if 'stop_event' in st.session_state:
+            st.session_state.stop_event.set()
+        st.session_state.is_crawling = False
+        st.rerun()
+
 if start_crawl_button:
     parsed_base = urlparse(start_url)
     target_hostname = parsed_base.hostname.lower() if parsed_base.hostname else parsed_base.netloc.lower()
@@ -764,6 +908,7 @@ if start_crawl_button:
         "User-Agent": chosen_ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
     }
 
     config = {
@@ -780,39 +925,66 @@ if start_crawl_button:
         "db_path": temp_db
     }
 
-    status_box = st.status("Initializing SEO Crawler...", expanded=True)
+    st.session_state.is_crawling = True
+    st.session_state.temp_db = temp_db
+    st.session_state.target_hostname = target_hostname
+    st.session_state.update_queue = Queue()
+    st.session_state.stop_event = threading.Event()
+    
+    # Launch background thread
+    t = threading.Thread(target=run_crawl_thread, args=(config, st.session_state.update_queue, st.session_state.stop_event))
+    add_script_run_ctx(t)
+    st.session_state.thread = t
+    t.start()
+    st.rerun()
+
+# --- Monitor Background Thread ---
+if st.session_state.get('is_crawling'):
+    status_box = st.status("Crawler Running...", expanded=True)
     prog_bar = status_box.progress(0.0)
     metrics_placeholder = status_box.empty()
+    metrics_stats = status_box.empty()
 
-    def update_progress(ratio, pages, total_fetches, queue_len):
-        prog_bar.progress(ratio)
-        metrics_placeholder.markdown(f"**Pages Parsed:** `{pages}/{crawl_limit}` | **Total Fetches:** `{total_fetches}` | **Queue Remaining:** `{queue_len}`")
+    # Drain queue
+    done = False
+    last_status = "Crawling..."
+    while not st.session_state.update_queue.empty():
+        msg = st.session_state.update_queue.get()
+        if "done" in msg:
+            done = True
+        elif "error" in msg:
+            st.error(f"Error: {msg['error']}")
+        elif "status" in msg:
+            last_status = msg["status"]
+            status_box.update(label=last_status)
+        elif "progress" in msg:
+            prog_bar.progress(msg["progress"])
+            metrics_placeholder.markdown(f"**Pages Parsed:** `{msg['pages']}/{crawl_limit}` | **Total Fetches:** `{msg['processed']}` | **Queue Remaining:** `{msg['queue_len']}`")
+            metrics_stats.markdown(f"⏱ **Speed:** `{msg['speed']} req/s` | 🧠 **RAM:** `{msg['mem']} MB` | ⚡ **Active TTFB:** `{msg['ttfb']}s`")
 
-    def update_status(text):
-        status_box.write(text)
+    if done or not st.session_state.thread.is_alive():
+        st.session_state.is_crawling = False
+        st.rerun()
+    else:
+        time.sleep(0.5)
+        st.rerun()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        sitemaps_found = loop.run_until_complete(execute_crawl(config, update_progress, update_status))
-    finally:
-        loop.close()
+# --- Post-Crawl Analysis ---
+if not st.session_state.get('is_crawling') and 'temp_db' in st.session_state:
+    if 'audit_results' not in st.session_state:
+        with st.status("✅ Audit Complete! Generating analysis report...", expanded=True) as status_box:
+            results = run_full_analysis(st.session_state.temp_db)
+            st.session_state['audit_results'] = results
+            st.session_state['audit_url'] = st.session_state.target_hostname
+            status_box.update(label="✅ Analysis Ready!", state="complete", expanded=False)
 
-    status_box.update(label="Crawling Complete! Analyzing data...", state="running")
-    results = run_full_analysis(temp_db, sitemaps_found)
-    status_box.update(label="✅ Audit Complete!", state="complete", expanded=False)
-
-    st.session_state['audit_results'] = results
-    st.session_state['audit_url'] = target_hostname
-
-# Render Dashboard Results
 if 'audit_results' in st.session_state:
     res = st.session_state['audit_results']
     host = st.session_state['audit_url']
 
     st.subheader(f"Audit Dashboard: {host}")
 
-    df_int = res['internal']
+    df_int = res['Internal Pages']
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     with kpi1:
         st.metric("Total Crawled Pages", len(df_int))
@@ -826,7 +998,7 @@ if 'audit_results' in st.session_state:
         dup_count = df_int['Duplicate Title'].sum() if ('Duplicate Title' in df_int.columns) else 0
         st.metric("Duplicate Titles", int(dup_count))
 
-    excel_file = create_excel_report(res)
+    excel_file = create_excel_report_streaming(res)
     st.download_button(
         label="📥 Download Full Excel Workbook (.xlsx)",
         data=excel_file,
@@ -835,42 +1007,49 @@ if 'audit_results' in st.session_state:
         type="primary"
     )
 
-    tab_issues, tab_internal, tab_duplicates, tab_links, tab_images, tab_errors = st.tabs([
+    tab_issues, tab_internal, tab_duplicates, tab_links, tab_images, tab_orphans, tab_errors = st.tabs([
         "⚠️ Issues Summary",
         "📄 Internal Pages",
         "👥 Duplicates",
         "🔗 Internal Links",
         "🖼️ Images",
+        "👤 Orphan Pages",
         "🚨 Crawl Errors"
     ])
 
     with tab_issues:
-        if not res['issues'].empty:
-            st.dataframe(res['issues'], use_container_width=True, hide_index=True)
+        if not res['Issues Summary'].empty:
+            st.dataframe(res['Issues Summary'], use_container_width=True, hide_index=True)
         else:
             st.success("No technical issues flagged!")
 
     with tab_internal:
         if not df_int.empty:
-            cols_to_show = ['Address', 'Status Code', 'Indexability', 'Indexability Reason', 'Title 1', 'Word Count', 'Canonical Match', 'TTFB (s)']
+            cols_to_show = ['Address', 'Status Code', 'Indexability', 'Indexability Reason', 'Title 1', 'Word Count', 'SPA App Shell', 'Canonical Match', 'TTFB (s)']
             st.dataframe(df_int[[c for c in cols_to_show if c in df_int.columns]], use_container_width=True)
 
     with tab_duplicates:
-        if not res['duplicates'].empty:
-            st.dataframe(res['duplicates'], use_container_width=True, hide_index=True)
+        if not res['Duplicates'].empty:
+            st.dataframe(res['Duplicates'], use_container_width=True, hide_index=True)
         else:
             st.info("No duplicate content or titles identified.")
 
     with tab_links:
-        if not res['links_internal'].empty:
-            st.dataframe(res['links_internal'].head(1000), use_container_width=True)
+        if not res['Internal Links'].empty:
+            st.dataframe(res['Internal Links'].head(1000), use_container_width=True)
 
     with tab_images:
-        if not res['images'].empty:
-            st.dataframe(res['images'].head(1000), use_container_width=True)
+        if not res['Images'].empty:
+            st.dataframe(res['Images'].head(1000), use_container_width=True)
+
+    with tab_orphans:
+        if not res['Orphan Pages'].empty:
+            st.dataframe(res['Orphan Pages'], use_container_width=True, hide_index=True)
+        else:
+            st.success("Zero orphan URLs detected.")
 
     with tab_errors:
-        if not res['errors'].empty:
-            st.dataframe(res['errors'], use_container_width=True, hide_index=True)
+        if not res['Crawl Errors'].empty:
+            st.dataframe(res['Crawl Errors'], use_container_width=True, hide_index=True)
         else:
             st.success("Zero crawl-time network/bot errors.")
