@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import tempfile
 import warnings
-import struct
+import gc
 from io import BytesIO
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse, urldefrag, parse_qsl, urlencode
@@ -64,6 +64,7 @@ TITLE_GLYPH_WIDTHS = {'default': 7.0, 'narrow': 3.5, 'wide': 10.0}
 NARROW_CHARS = set("ijlI|.,;:'!`")
 WIDE_CHARS = set("WMmw")
 TITLE_PIXEL_MAX, META_PIXEL_MAX = 580, 920
+MAX_HTML_BODY_BYTES = 4 * 1024 * 1024  # 4MB cap to prevent OOM on giant files
 
 NON_HTML_EXTS = {
     '.xml', '.gz', '.zip', '.rar', '.tar', '.7z', '.pdf', '.doc', '.docx',
@@ -74,7 +75,6 @@ NON_HTML_EXTS = {
     '.atom'
 }
 
-# ISO 639-1 Language Codes & ISO 3166-1 Alpha-2 Country Codes
 ISO_639_1_LANGS = {
     'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
     'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs', 'ca', 'ce',
@@ -121,7 +121,6 @@ ISO_3166_1_COUNTRIES = {
 # ==============================================================================
 # 2. ADVANCED MATHEMATICAL & INTELLIGENCE ENGINES
 # ==============================================================================
-
 def extract_registered_domain(netloc):
     if HAS_TLDEXTRACT:
         ext = tldextract.extract(netloc)
@@ -158,7 +157,6 @@ def normalize_url(url: str, strip_trailing_slash: bool = False, strip_www: bool 
         return url
 
 def is_crawlable_url(url: str) -> bool:
-    """Ensure child sitemaps, non-HTML documents, and assets are filtered out."""
     try:
         p = urlparse(url)
         if p.scheme not in ('http', 'https'):
@@ -179,21 +177,16 @@ def estimate_pixel_width(text, scale=1.0):
     return round(total * scale, 1)
 
 def compute_simhash_64(text: str) -> int:
-    """
-    Computes a 64-bit SimHash fingerprint for near-duplicate content detection.
-    Uses word 3-grams and token weighting.
-    """
     if not text or len(text.strip()) < 10:
         return 0
     words = re.findall(r'\w+', text.lower())
     if not words:
         return 0
     
-    # Generate 3-grams and unigrams
     features = []
     for i in range(len(words) - 2):
         features.append(f"{words[i]}_{words[i+1]}_{words[i+2]}")
-    features.extend(words)
+    features.extend(words[:150])  # Cap tokens to maintain fast hashing
     
     feature_counts = Counter(features)
     v = [0] * 64
@@ -213,7 +206,6 @@ def compute_simhash_64(text: str) -> int:
     return fingerprint
 
 def simhash_similarity(h1: int, h2: int) -> float:
-    """Computes similarity percentage between two 64-bit SimHash fingerprints."""
     if h1 == 0 or h2 == 0:
         return 0.0
     x = h1 ^ h2
@@ -221,9 +213,6 @@ def simhash_similarity(h1: int, h2: int) -> float:
     return round((1.0 - (hamming_dist / 64.0)) * 100, 1)
 
 def calculate_internal_pagerank(df_pages, df_links_internal, damping=0.85, max_iter=100, tol=1e-6):
-    """
-    Computes exact internal PageRank across the site link graph using power iteration.
-    """
     if df_pages.empty:
         return {}, {}, {}
     
@@ -269,9 +258,9 @@ def calculate_internal_pagerank(df_pages, df_links_internal, damping=0.85, max_i
         if max_pr == min_pr:
             score_dict[n] = 50.0
         else:
-            log_min = -12.0 if min_pr <= 0 else min(0.0, float(pd.np.log10(min_pr) if hasattr(pd, 'np') else __import__('math').log10(min_pr)))
-            log_max = float(pd.np.log10(max_pr) if hasattr(pd, 'np') else __import__('math').log10(max_pr))
-            log_val = float(pd.np.log10(val) if hasattr(pd, 'np') else __import__('math').log10(val))
+            log_min = -12.0 if min_pr <= 0 else min(0.0, float(__import__('math').log10(min_pr)))
+            log_max = float(__import__('math').log10(max_pr))
+            log_val = float(__import__('math').log10(val))
             norm = (log_val - log_min) / (log_max - log_min + 1e-9)
             score_dict[n] = round(max(0.0, min(100.0, norm * 100)), 1)
             
@@ -281,9 +270,6 @@ def calculate_internal_pagerank(df_pages, df_links_internal, damping=0.85, max_i
     return pr, score_dict, percentile_dict
 
 def validate_hreflang_matrix(df_internal):
-    """
-    Validates bidirectional hreflang clusters, self-referential tags, and ISO conformance.
-    """
     if df_internal.empty or 'Hreflang Tags' not in df_internal.columns:
         return pd.DataFrame(), 0
     
@@ -308,7 +294,6 @@ def validate_hreflang_matrix(df_internal):
             if norm_target == source_url:
                 has_self_ref = True
                 
-            # 1. ISO Code Validation
             iso_error = ""
             if hl_code_clean != 'x-default':
                 parts = hl_code_clean.split('-')
@@ -326,7 +311,6 @@ def validate_hreflang_matrix(df_internal):
                 else:
                     iso_error = f"Malformed Hreflang Syntax '{hl_code_clean}'"
                     
-            # 2. Reciprocal Return Tag Validation & Target Status
             return_status = "Valid"
             target_status = "Unknown"
             
@@ -381,9 +365,6 @@ def validate_hreflang_matrix(df_internal):
     return df_hreflang, int(issue_count)
 
 def parse_gsc_performance_data(file_bytes_or_buffer):
-    """
-    Parses Google Search Console CSV exports (e.g. Pages.csv) and standardizes columns.
-    """
     try:
         df = pd.read_csv(file_bytes_or_buffer)
         col_map = {}
@@ -465,11 +446,6 @@ class ResponseShim:
             self.text = ""
 
 def content_for_hashing(soup):
-    """
-    Extract clean body content for duplicate detection hashing.
-    Only removes <nav>, <header>, <footer>, <aside>, <script>, <style>, <noscript>, <template>, <iframe>, <svg>.
-    Does NOT strip article/product body containers so blog posts and products never produce a null Content Hash.
-    """
     try:
         body = soup.find('body') or soup
         c_soup = BeautifulSoup(str(body), 'html.parser')
@@ -715,7 +691,7 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     return row, link_rows, image_rows
 
 # ==============================================================================
-# 4. SITEMAP & ASYNC CRAWLER ENGINE
+# 4. SITEMAP & HARDENED ASYNC CRAWLER ENGINE
 # ==============================================================================
 def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
     candidate_hosts = {target_hostname, f"www.{target_hostname.replace('www.', '')}", target_hostname.replace('www.', '')}
@@ -864,7 +840,7 @@ async def execute_crawl(config, progress_callback, status_callback):
     host_last_req = defaultdict(lambda: 0.0)
 
     async def polite_delay(host):
-        delay = 0.4 + (random.uniform(0.1, 0.4) if stealth_jitter else 0.0)
+        delay = 0.35 + (random.uniform(0.1, 0.3) if stealth_jitter else 0.0)
         async with host_locks[host]:
             elapsed = time.time() - host_last_req[host]
             if elapsed < delay:
@@ -875,6 +851,7 @@ async def execute_crawl(config, progress_callback, status_callback):
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
+    # Hardened fetch_async: Inspects headers first, streams body with 4MB max cap
     async def fetch_async(session_aio, url, depth):
         host = urlparse(url).hostname or target_hostname
         last_status = None
@@ -882,14 +859,26 @@ async def execute_crawl(config, progress_callback, status_callback):
             await polite_delay(host)
             start = time.time()
             try:
-                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=25), allow_redirects=True, ssl=ssl_ctx) as resp:
+                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True, ssl=ssl_ctx) as resp:
                     if resp.status in RETRY_STATUSES and attempt < MAX_RETRIES:
                         last_status = resp.status
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await asyncio.sleep(1.2 * (attempt + 1))
                         continue
-                    content = await resp.read()
+                    
+                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                    ct = resp_headers.get('content-type', '').lower()
+                    
+                    # Memory Guard: If non-HTML (e.g. PDF, video, zip), don't buffer massive payload
+                    if 'text/html' not in ct and 'application/xhtml' not in ct:
+                        shim = ResponseShim(resp.status, str(resp.url), resp_headers, b'')
+                        row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
+                        row["TTFB (s)"] = round(time.time() - start, 3)
+                        return row, links, images, None
+                        
+                    # Stream read HTML body up to MAX_HTML_BODY_BYTES to prevent memory blowout
+                    content = await resp.content.read(MAX_HTML_BODY_BYTES)
                     hist = [ResponseShim(h.status, str(h.url), {}, b'') for h in resp.history]
-                    shim = ResponseShim(resp.status, str(resp.url), {k.lower(): v for k, v in resp.headers.items()}, content, hist)
+                    shim = ResponseShim(resp.status, str(resp.url), resp_headers, content, hist)
                     row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
                     row["TTFB (s)"] = round(time.time() - start, 3)
                     del shim
@@ -897,7 +886,7 @@ async def execute_crawl(config, progress_callback, status_callback):
                     return row, links, images, None
             except Exception as e:
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1.0 * (attempt + 1))
+                    await asyncio.sleep(0.8 * (attempt + 1))
                     continue
                 row, links, images = build_row(url, depth, is_in_scope, exc=e, in_sitemap=(url in sitemap_pages))
                 return row, links, images, e
@@ -910,6 +899,7 @@ async def execute_crawl(config, progress_callback, status_callback):
     pages_counted, processed, error_count = 0, 0, 0
     fetch_ceiling = crawl_limit * 3
     start_time_crawl = time.time()
+    last_ui_update = 0.0
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as aio_session:
         while (queue or (pages_counted < crawl_limit and any(u not in visited and u not in queued for u in sitemap_pages))) and pages_counted < crawl_limit and processed < fetch_ceiling:
@@ -970,21 +960,31 @@ async def execute_crawl(config, progress_callback, status_callback):
                 if row.get('Indexability') != 'Redirected':
                     pages_counted += 1
                 
-                elapsed = max(0.1, time.time() - start_time_crawl)
+            cur.execute("COMMIT")
+
+            # Throttled Streamlit UI Update (every 400ms) to prevent WebSocket queue drops
+            now = time.time()
+            if now - last_ui_update > 0.4 or pages_counted >= crawl_limit:
+                elapsed = max(0.1, now - start_time_crawl)
                 speed = round(processed / elapsed, 1)
                 mem = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1) if HAS_PSUTIL else 0.0
                 progress_callback(min(pages_counted / crawl_limit, 1.0), pages_counted, processed, len(queue), speed, mem, row.get("TTFB (s)", 0.0))
-            cur.execute("COMMIT")
+                last_ui_update = now
 
-        status_callback("📏 Measuring image payload sizes...")
-        cur.execute("SELECT DISTINCT address FROM images")
+            # Periodic memory garbage collection every 250 pages
+            if processed % 250 == 0:
+                gc.collect()
+
+        # Chunked Image Payload Sizer (Batched in 50s with max limit to avoid OOM)
+        status_callback("📏 Measuring image payload sizes in batches...")
+        cur.execute("SELECT DISTINCT address FROM images LIMIT 2500")
         img_urls = [r[0] for r in cur.fetchall()]
         if img_urls:
-            sem = asyncio.Semaphore(15)
+            sem = asyncio.Semaphore(12)
             async def get_img_size(u):
                 async with sem:
                     try:
-                        async with aio_session.head(u, timeout=aiohttp.ClientTimeout(total=6), ssl=ssl_ctx) as r_img:
+                        async with aio_session.head(u, timeout=aiohttp.ClientTimeout(total=4), ssl=ssl_ctx) as r_img:
                             cl = r_img.headers.get('Content-Length')
                             if cl and cl.isdigit():
                                 return u, round(int(cl) / 1024, 2)
@@ -992,12 +992,16 @@ async def execute_crawl(config, progress_callback, status_callback):
                         pass
                     return u, 0.0
 
-            img_sizes = await asyncio.gather(*[get_img_size(u) for u in img_urls])
-            cur.execute("BEGIN TRANSACTION")
-            cur.executemany("UPDATE images SET size_kb = ? WHERE address = ?", [(sz, u) for u, sz in img_sizes])
-            cur.execute("COMMIT")
+            chunk_size = 50
+            for i in range(0, len(img_urls), chunk_size):
+                chunk = img_urls[i:i+chunk_size]
+                img_sizes = await asyncio.gather(*[get_img_size(u) for u in chunk])
+                cur.execute("BEGIN TRANSACTION")
+                cur.executemany("UPDATE images SET size_kb = ? WHERE address = ?", [(sz, u) for u, sz in img_sizes])
+                cur.execute("COMMIT")
 
     conn.close()
+    gc.collect()
     return target_hostname
 
 # ==============================================================================
@@ -1050,15 +1054,17 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
                 'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth'
             ]].sort_values('PageRank Score', ascending=False)
 
-    # 4. SimHash Near-Duplicate Detection
+    # 4. Optimized SimHash Near-Duplicate Detection (Capped pairwise loop to prevent OOM)
     near_dup_records = []
     if not df_internal.empty and 'SimHash' in df_internal.columns:
         pages_with_hash = df_internal[df_internal['SimHash'] > 0][['Address', 'Title 1', 'SimHash', 'Word Count', 'Status Code']]
         pages_with_hash = pages_with_hash[pages_with_hash['Status Code'] == 200].to_dict('records')
         
-        for i in range(len(pages_with_hash)):
-            for j in range(i + 1, len(pages_with_hash)):
-                p1, p2 = pages_with_hash[i], pages_with_hash[j]
+        # Limit comparisons to max 2,000 pages to avoid quadratic memory freeze
+        limit_pages = pages_with_hash[:2000]
+        for i in range(len(limit_pages)):
+            for j in range(i + 1, min(i + 200, len(limit_pages))):
+                p1, p2 = limit_pages[i], limit_pages[j]
                 sim = simhash_similarity(p1['SimHash'], p2['SimHash'])
                 if sim >= simhash_threshold:
                     near_dup_records.append({
@@ -1135,7 +1141,6 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
     if not df_internal.empty:
         parsed = df_internal[(df_internal['Status Code'] == 200) & (df_internal['Word Count'] > 0)]
         
-        # Architecture & Graph Issues
         if spa_shell_count > 0:
             add_issue("Architecture", "Critical", spa_shell_count, "Client-Side Rendered (SPA) Shell Detected — Routes return identical raw HTML shell")
         if not df_equity_sinkholes.empty:
@@ -1143,50 +1148,40 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
         if gsc_at_risk_count > 0:
             add_issue("Traffic Risk", "Critical", gsc_at_risk_count, "High Organic Traffic Pages at Risk (GSC Clicked Pages Returning 4xx/5xx/Noindex)")
 
-        # Status & Response Issues
         add_issue("Status", "Critical", (df_internal['Status Code'] >= 500).sum(), "5xx Server Errors")
         add_issue("Status", "Critical", (df_internal['Status Code'] == 404).sum(), "404 Not Found Pages")
         add_issue("Status", "High", (df_internal['Status Code'].isin([301, 308])).sum(), "Permanent Redirects (301/308)")
         
-        # Broken Internal Links (4xx/5xx)
         if not df_links_internal.empty:
             status_map = dict(zip(df_internal['Address'].apply(normalize_url), df_internal['Status Code']))
             dest_statuses = df_links_internal['destination'].map(status_map).fillna(0)
             broken_int_links_count = int((dest_statuses >= 400).sum())
             add_issue("Links", "High", broken_int_links_count, "Broken Internal Links (4xx/5xx Destination)")
 
-        # Near-Duplicates (SimHash)
         if not df_near_duplicates.empty:
             add_issue("Content", "High", len(df_near_duplicates), f"Near-Duplicate Content Pairs (SimHash Similarity ≥ {simhash_threshold}%)")
 
-        # Title Tag Issues
         add_issue("Titles", "High", (parsed['Title Status'] == 'Missing').sum(), "Missing Title Tags")
         add_issue("Titles", "Medium", (parsed['Title Status'] == 'Too Short').sum(), "Short Title Tags (<200px)")
         add_issue("Titles", "Medium", (parsed['Title Status'] == 'Too Long').sum(), "Titles Exceeding 580px")
         add_issue("Titles", "High", parsed.get('Duplicate Title', pd.Series()).sum(), "Duplicate Titles")
         
-        # Meta Description Issues
         add_issue("Meta Description", "High", (parsed['Meta Status'] == 'Missing').sum(), "Missing Meta Descriptions")
         add_issue("Meta Description", "Medium", (parsed['Meta Status'] == 'Too Long').sum(), "Oversized Meta Descriptions (>920px)")
         add_issue("Meta Description", "Low", (parsed['Meta Status'] == 'Too Short').sum(), "Short Meta Descriptions (<400px)")
 
-        # Heading Tag Issues (H1)
         add_issue("Headings", "High", (parsed['H1 Count'] == 0).sum(), "Missing H1 Tags")
         add_issue("Headings", "Medium", (parsed['H1 Count'] > 1).sum(), "Multiple H1 Tags")
         add_issue("Headings", "High", parsed.get('Duplicate H1', pd.Series()).sum(), "Duplicate H1 Tags")
 
-        # Content Issues
         add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content (MD5 Exact Match)")
         add_issue("Content", "Medium", (parsed['Word Count'] < 200).sum(), "Thin Content (<200 words)")
         
-        # Canonical Issues
         add_issue("Canonical", "High", (parsed['Canonical Count'] > 1).sum(), "Multiple Canonical Tags")
         add_issue("Canonical", "Medium", (parsed['Canonical Match'] == 'Different').sum(), "Canonicalized to a Different URL")
         
-        # Hreflang Issues
         add_issue("Hreflang", "High", hreflang_issues_count, "Hreflang Validation Errors (Missing Return Tag, Invalid ISO Code, or Missing Self-Ref)")
 
-    # Image Issues
     if not df_images.empty:
         missing_alt_count = int((df_images['Alt Text'].isin(['(Missing)', '', None]) | df_images['Alt Text'].isna()).sum())
         oversized_images_count = int((df_images['Size (KB)'] > 100).sum())
@@ -1201,6 +1196,7 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
 
     df_internal.drop(columns=['__norm'], errors='ignore', inplace=True)
     conn.close()
+    gc.collect()
     
     return {
         "Issues Summary": df_issues,
@@ -1243,9 +1239,8 @@ st.set_page_config(page_title="SEO-Diver Enterprise Auditor", page_icon="🕷️
 st.title("🕷️ SEO-Diver Technical Auditor — Enterprise Tier 1")
 st.caption("Enterprise technical SEO crawler: Internal PageRank modeling, SimHash near-duplicate clustering, Hreflang reciprocity matrix, and Google Search Console performance data fusion.")
 
-# Sidebar Configuration
 st.sidebar.header("🎯 Crawl Parameters")
-start_url = st.sidebar.text_input("Start URL", "https://www.example.com/").strip().rstrip('/')
+start_url = st.sidebar.text_input("Start URL", "https://almarai.com/").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
     start_url = 'https://' + start_url
 
@@ -1257,7 +1252,7 @@ scope_mode = st.sidebar.selectbox(
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
-    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=50000, value=250, step=50)
+    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=50000, value=2500, step=250)
 with col_b:
     concurrency = st.slider("Concurrency", min_value=1, max_value=24, value=8)
 
@@ -1272,14 +1267,12 @@ ua_map = {
 }
 chosen_ua = ua_map[ua_choice]
 
-# Advanced Tier 1 Settings Accordion
 with st.sidebar.expander("⚙️ Tier 1 Advanced Algorithms", expanded=False):
     pr_damping = st.slider("PageRank Damping Factor", min_value=0.50, max_value=0.95, value=0.85, step=0.05)
     simhash_threshold = st.slider("SimHash Duplicate Threshold (%)", min_value=70, max_value=98, value=85, step=1)
     stealth_jitter = st.toggle("Enable Stealth Jitter (Anti-WAF)", value=True)
     respect_robots = st.toggle("Respect robots.txt", value=False)
 
-# Google Search Console Upload
 st.sidebar.markdown("---")
 st.sidebar.subheader("📈 Google Search Console (GSC)")
 gsc_file = st.sidebar.file_uploader("Upload GSC Pages.csv", type=["csv", "txt"], help="Upload an exported Pages.csv from Google Search Console to correlate organic traffic with technical health.")
@@ -1350,7 +1343,6 @@ if start_crawl_button:
     st.session_state['audit_results'] = results
     st.session_state['audit_url'] = final_target_host
 
-# Render Dashboard
 if 'audit_results' in st.session_state:
     res = st.session_state['audit_results']
     host = st.session_state['audit_url']
