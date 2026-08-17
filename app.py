@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import time
 import json
 import gzip
@@ -156,6 +157,7 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "Size (KB)": 0, "TTFB (s)": 0, "Content Hash": "", "Last-Modified": "", "ETag": "",
     }
     if exc:
+        row["Indexability"] = "Error"
         row["Indexability Reason"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         return row, [], []
 
@@ -441,19 +443,35 @@ async def execute_crawl(config, progress_callback, status_text_callback):
     headers = config['headers']
     db_path = config['db_path']
 
+    # Initial pre-flight probe: resolve apex/www redirects
+    try:
+        with requests.Session() as s:
+            s.headers.update(headers)
+            r_init = s.get(base_url, timeout=10, allow_redirects=True)
+            final_p = urlparse(r_init.url)
+            if final_p.hostname:
+                final_host = final_p.hostname.lower()
+                if final_host != target_hostname and extract_registered_domain(final_host) == root_domain:
+                    target_hostname = final_host
+                    base_url = r_init.url
+    except Exception:
+        pass
+
     def is_in_scope(url: str) -> bool:
         try:
             p = urlparse(url)
         except Exception:
             return False
         hostname = (p.hostname or "").lower()
-        if not hostname: return False
+        if not hostname:
+            return False
         if scope_mode == "Root Domain & Subdomains":
             return extract_registered_domain(hostname) == root_domain
         if scope_mode == "This Subdomain Only":
-            return hostname == target_hostname
+            return hostname == target_hostname or hostname.replace("www.", "") == target_hostname.replace("www.", "")
         if scope_mode == "This Subfolder Only":
-            return hostname == target_hostname and p.path.startswith(base_path)
+            matches_host = (hostname == target_hostname or hostname.replace("www.", "") == target_hostname.replace("www.", ""))
+            return matches_host and p.path.startswith(base_path)
         return False
 
     conn = sqlite3.connect(db_path)
@@ -501,6 +519,11 @@ async def execute_crawl(config, progress_callback, status_text_callback):
                 await asyncio.sleep(delay - elapsed)
             host_last_req[host] = time.time()
 
+    # SSL context configured to bypass verification without disabling TLS transport
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
     async def fetch_async(session_aio, url, depth):
         host = urlparse(url).hostname or target_hostname
         last_status = None
@@ -508,7 +531,7 @@ async def execute_crawl(config, progress_callback, status_text_callback):
             await polite_delay(host)
             start = time.time()
             try:
-                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=True) as resp:
+                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=30), allow_redirects=True, ssl=ssl_ctx) as resp:
                     if resp.status in RETRY_STATUSES and attempt < MAX_RETRIES:
                         last_status = resp.status
                         await asyncio.sleep(2.0 * (attempt + 1))
@@ -530,7 +553,7 @@ async def execute_crawl(config, progress_callback, status_text_callback):
         row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
         return row, links, images, None
 
-    connector = aiohttp.TCPConnector(limit=concurrency * 2, ssl=False, force_close=True)
+    connector = aiohttp.TCPConnector(limit=concurrency * 2, force_close=True, ssl=ssl_ctx)
     pages_counted, processed, error_count = 0, 0, 0
     fetch_ceiling = crawl_limit * 3
 
@@ -593,7 +616,7 @@ def run_full_analysis(db_path, sitemap_pages_set):
     df_internal = pd.DataFrame(rows) if rows else pd.DataFrame()
     df_links = pd.read_sql_query("SELECT source, destination, anchor, nofollow, in_scope as [In Scope] FROM links", conn)
     df_images = pd.read_sql_query("SELECT address, alt as [Alt Text], size_kb as [Size (KB)], parent_page as [Parent Page], loading FROM images", conn)
-    df_errors = pd.read_sql_query("SELECT url, error_type as [Error Type], message as Message, ts as Timestamp FROM errors", conn)
+    df_errors = pd.read_sql_query("SELECT url as [Address], error_type as [Error Type], message as Message, ts as Timestamp FROM errors", conn)
     
     df_links_internal = df_links[df_links['In Scope'] == 1].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame()
     df_links_external = df_links[df_links['In Scope'] == 0].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame()
@@ -679,7 +702,6 @@ def create_excel_report(data_dict):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for sheet_name, df in data_dict.items():
             if isinstance(df, pd.DataFrame) and not df.empty:
-                # Sanitize cell length for Excel max limits
                 clean_df = df.copy()
                 for col in clean_df.select_dtypes(include=['object']).columns:
                     clean_df[col] = clean_df[col].apply(lambda v: v[:32700] if isinstance(v, str) else v)
@@ -709,7 +731,7 @@ scope_mode = st.sidebar.selectbox(
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
-    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=20000, value=250, step=50)
+    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=20000, value=100, step=50)
 with col_b:
     concurrency = st.slider("Concurrency", min_value=1, max_value=16, value=5)
 
@@ -725,7 +747,7 @@ ua_map = {
 chosen_ua = ua_map[ua_choice]
 
 stealth_jitter = st.sidebar.toggle("Enable Stealth Jitter (Anti-WAF)", value=True)
-respect_robots = st.sidebar.toggle("Respect robots.txt", value=True)
+respect_robots = st.sidebar.toggle("Respect robots.txt", value=False)
 
 start_crawl_button = st.sidebar.button("🚀 Start SEO Audit", type="primary", use_container_width=True)
 
@@ -742,7 +764,6 @@ if start_crawl_button:
         "User-Agent": chosen_ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
     }
 
     config = {
@@ -770,7 +791,6 @@ if start_crawl_button:
     def update_status(text):
         status_box.write(text)
 
-    # Run Crawl Lifecycle safely inside Streamlit
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -792,7 +812,6 @@ if 'audit_results' in st.session_state:
 
     st.subheader(f"Audit Dashboard: {host}")
 
-    # Top KPI Metrics
     df_int = res['internal']
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     with kpi1:
@@ -807,7 +826,6 @@ if 'audit_results' in st.session_state:
         dup_count = df_int['Duplicate Title'].sum() if ('Duplicate Title' in df_int.columns) else 0
         st.metric("Duplicate Titles", int(dup_count))
 
-    # Download Button
     excel_file = create_excel_report(res)
     st.download_button(
         label="📥 Download Full Excel Workbook (.xlsx)",
@@ -817,13 +835,13 @@ if 'audit_results' in st.session_state:
         type="primary"
     )
 
-    # Interactive Inspection Tabs
-    tab_issues, tab_internal, tab_duplicates, tab_links, tab_images = st.tabs([
+    tab_issues, tab_internal, tab_duplicates, tab_links, tab_images, tab_errors = st.tabs([
         "⚠️ Issues Summary",
         "📄 Internal Pages",
         "👥 Duplicates",
         "🔗 Internal Links",
-        "🖼️ Images"
+        "🖼️ Images",
+        "🚨 Crawl Errors"
     ])
 
     with tab_issues:
@@ -833,8 +851,8 @@ if 'audit_results' in st.session_state:
             st.success("No technical issues flagged!")
 
     with tab_internal:
-        if not res['internal'].empty:
-            cols_to_show = ['Address', 'Status Code', 'Indexability', 'Title 1', 'Word Count', 'Canonical Match', 'TTFB (s)']
+        if not df_int.empty:
+            cols_to_show = ['Address', 'Status Code', 'Indexability', 'Indexability Reason', 'Title 1', 'Word Count', 'Canonical Match', 'TTFB (s)']
             st.dataframe(df_int[[c for c in cols_to_show if c in df_int.columns]], use_container_width=True)
 
     with tab_duplicates:
@@ -850,3 +868,9 @@ if 'audit_results' in st.session_state:
     with tab_images:
         if not res['images'].empty:
             st.dataframe(res['images'].head(1000), use_container_width=True)
+
+    with tab_errors:
+        if not res['errors'].empty:
+            st.dataframe(res['errors'], use_container_width=True, hide_index=True)
+        else:
+            st.success("Zero crawl-time network/bot errors.")
