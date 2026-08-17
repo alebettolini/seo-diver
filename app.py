@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import tempfile
 import warnings
-import gc
+import struct
 from io import BytesIO
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse, urldefrag, parse_qsl, urlencode
@@ -64,7 +64,6 @@ TITLE_GLYPH_WIDTHS = {'default': 7.0, 'narrow': 3.5, 'wide': 10.0}
 NARROW_CHARS = set("ijlI|.,;:'!`")
 WIDE_CHARS = set("WMmw")
 TITLE_PIXEL_MAX, META_PIXEL_MAX = 580, 920
-MAX_HTML_BODY_BYTES = 4 * 1024 * 1024  # 4MB cap to prevent OOM on giant files
 
 NON_HTML_EXTS = {
     '.xml', '.gz', '.zip', '.rar', '.tar', '.7z', '.pdf', '.doc', '.docx',
@@ -75,6 +74,7 @@ NON_HTML_EXTS = {
     '.atom'
 }
 
+# ISO 639-1 Language Codes & ISO 3166-1 Alpha-2 Country Codes
 ISO_639_1_LANGS = {
     'aa', 'ab', 'ae', 'af', 'ak', 'am', 'an', 'ar', 'as', 'av', 'ay', 'az',
     'ba', 'be', 'bg', 'bh', 'bi', 'bm', 'bn', 'bo', 'br', 'bs', 'ca', 'ce',
@@ -186,7 +186,7 @@ def compute_simhash_64(text: str) -> int:
     features = []
     for i in range(len(words) - 2):
         features.append(f"{words[i]}_{words[i+1]}_{words[i+2]}")
-    features.extend(words[:150])  # Cap tokens to maintain fast hashing
+    features.extend(words)
     
     feature_counts = Counter(features)
     v = [0] * 64
@@ -665,7 +665,6 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "size_kb": 0
     } for img in extract_images(soup, resp.url)]
 
-    # Compute visible text, word count & SimHash
     clean_soup = BeautifulSoup(resp.text, 'html.parser')
     for tag in list(clean_soup(['script', 'style', 'noscript', 'template', 'iframe', 'svg'])):
         try:
@@ -683,7 +682,6 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     if len(resp.content) > 100:
         row["Text/HTML Ratio (%)"] = round(len(body_text) / len(resp.content) * 100, 2)
 
-    # Content Deduplication Hash (Exact MD5 + 64-bit SimHash)
     normalized_content = content_for_hashing(clean_soup)
     row["Content Hash"] = hashlib.md5(normalized_content.encode('utf-8', errors='replace')).hexdigest() if normalized_content else ""
     row["SimHash"] = compute_simhash_64(normalized_content) if normalized_content else 0
@@ -691,64 +689,8 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
     return row, link_rows, image_rows
 
 # ==============================================================================
-# 4. SITEMAP & HARDENED ASYNC CRAWLER ENGINE
+# 4. ASYNC CRAWLER ENGINE (STREAMLIT DIRECT RUNNER)
 # ==============================================================================
-def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
-    candidate_hosts = {target_hostname, f"www.{target_hostname.replace('www.', '')}", target_hostname.replace('www.', '')}
-    candidates = set()
-    for host in candidate_hosts:
-        candidates.add(f"https://{host}/sitemap.xml")
-        candidates.add(f"https://{host}/sitemap_index.xml")
-        candidates.add(f"https://{host}/wp-sitemap.xml")
-        try:
-            r = session.get(f"https://{host}/robots.txt", timeout=8)
-            if r.status_code == 200:
-                for sm in RE_SITEMAP_DIRECTIVE.findall(r.text):
-                    candidates.add(sm.strip())
-        except Exception:
-            pass
-
-    seen_sitemaps = set()
-    all_urls = set()
-    queue = deque(candidates)
-
-    while queue:
-        sm_url = queue.popleft()
-        if sm_url in seen_sitemaps:
-            continue
-        seen_sitemaps.add(sm_url)
-        try:
-            r = session.get(sm_url, timeout=12)
-            if r.status_code != 200:
-                continue
-            text = r.text
-            if sm_url.endswith('.gz') or 'gzip' in r.headers.get('Content-Type', '').lower():
-                try:
-                    text = gzip.decompress(r.content).decode('utf-8', errors='replace')
-                except Exception:
-                    continue
-            
-            soup = BeautifulSoup(text, 'lxml-xml' if 'xml' in text[:200] else 'html.parser')
-            for sm in soup.find_all('sitemap'):
-                loc = sm.find('loc')
-                if loc and loc.text and loc.text.strip():
-                    child_sm = loc.text.strip()
-                    if child_sm not in seen_sitemaps:
-                        queue.append(child_sm)
-            for u in soup.find_all('url'):
-                loc = u.find('loc')
-                if loc and loc.text and loc.text.strip().startswith('http'):
-                    all_urls.add(loc.text.strip())
-        except Exception:
-            continue
-
-    sitemap_pages = set()
-    for u in all_urls:
-        norm = normalize_url(u)
-        if is_in_scope_fn(norm) and is_crawlable_url(norm):
-            sitemap_pages.add(norm)
-    return sitemap_pages
-
 RETRY_STATUSES = {429, 503, 520, 522, 524}
 MAX_RETRIES = 3
 
@@ -840,7 +782,7 @@ async def execute_crawl(config, progress_callback, status_callback):
     host_last_req = defaultdict(lambda: 0.0)
 
     async def polite_delay(host):
-        delay = 0.35 + (random.uniform(0.1, 0.3) if stealth_jitter else 0.0)
+        delay = 0.4 + (random.uniform(0.1, 0.4) if stealth_jitter else 0.0)
         async with host_locks[host]:
             elapsed = time.time() - host_last_req[host]
             if elapsed < delay:
@@ -851,7 +793,6 @@ async def execute_crawl(config, progress_callback, status_callback):
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    # Hardened fetch_async: Inspects headers first, streams body with 4MB max cap
     async def fetch_async(session_aio, url, depth):
         host = urlparse(url).hostname or target_hostname
         last_status = None
@@ -859,26 +800,14 @@ async def execute_crawl(config, progress_callback, status_callback):
             await polite_delay(host)
             start = time.time()
             try:
-                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=20), allow_redirects=True, ssl=ssl_ctx) as resp:
+                async with session_aio.get(url, timeout=aiohttp.ClientTimeout(total=25), allow_redirects=True, ssl=ssl_ctx) as resp:
                     if resp.status in RETRY_STATUSES and attempt < MAX_RETRIES:
                         last_status = resp.status
-                        await asyncio.sleep(1.2 * (attempt + 1))
+                        await asyncio.sleep(1.5 * (attempt + 1))
                         continue
-                    
-                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                    ct = resp_headers.get('content-type', '').lower()
-                    
-                    # Memory Guard: If non-HTML (e.g. PDF, video, zip), don't buffer massive payload
-                    if 'text/html' not in ct and 'application/xhtml' not in ct:
-                        shim = ResponseShim(resp.status, str(resp.url), resp_headers, b'')
-                        row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
-                        row["TTFB (s)"] = round(time.time() - start, 3)
-                        return row, links, images, None
-                        
-                    # Stream read HTML body up to MAX_HTML_BODY_BYTES to prevent memory blowout
-                    content = await resp.content.read(MAX_HTML_BODY_BYTES)
+                    content = await resp.read()
                     hist = [ResponseShim(h.status, str(h.url), {}, b'') for h in resp.history]
-                    shim = ResponseShim(resp.status, str(resp.url), resp_headers, content, hist)
+                    shim = ResponseShim(resp.status, str(resp.url), {k.lower(): v for k, v in resp.headers.items()}, content, hist)
                     row, links, images = build_row(url, depth, is_in_scope, resp=shim, in_sitemap=(url in sitemap_pages))
                     row["TTFB (s)"] = round(time.time() - start, 3)
                     del shim
@@ -886,7 +815,7 @@ async def execute_crawl(config, progress_callback, status_callback):
                     return row, links, images, None
             except Exception as e:
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(0.8 * (attempt + 1))
+                    await asyncio.sleep(1.0 * (attempt + 1))
                     continue
                 row, links, images = build_row(url, depth, is_in_scope, exc=e, in_sitemap=(url in sitemap_pages))
                 return row, links, images, e
@@ -899,7 +828,6 @@ async def execute_crawl(config, progress_callback, status_callback):
     pages_counted, processed, error_count = 0, 0, 0
     fetch_ceiling = crawl_limit * 3
     start_time_crawl = time.time()
-    last_ui_update = 0.0
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as aio_session:
         while (queue or (pages_counted < crawl_limit and any(u not in visited and u not in queued for u in sitemap_pages))) and pages_counted < crawl_limit and processed < fetch_ceiling:
@@ -960,31 +888,21 @@ async def execute_crawl(config, progress_callback, status_callback):
                 if row.get('Indexability') != 'Redirected':
                     pages_counted += 1
                 
-            cur.execute("COMMIT")
-
-            # Throttled Streamlit UI Update (every 400ms) to prevent WebSocket queue drops
-            now = time.time()
-            if now - last_ui_update > 0.4 or pages_counted >= crawl_limit:
-                elapsed = max(0.1, now - start_time_crawl)
+                elapsed = max(0.1, time.time() - start_time_crawl)
                 speed = round(processed / elapsed, 1)
                 mem = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1) if HAS_PSUTIL else 0.0
                 progress_callback(min(pages_counted / crawl_limit, 1.0), pages_counted, processed, len(queue), speed, mem, row.get("TTFB (s)", 0.0))
-                last_ui_update = now
+            cur.execute("COMMIT")
 
-            # Periodic memory garbage collection every 250 pages
-            if processed % 250 == 0:
-                gc.collect()
-
-        # Chunked Image Payload Sizer (Batched in 50s with max limit to avoid OOM)
-        status_callback("📏 Measuring image payload sizes in batches...")
-        cur.execute("SELECT DISTINCT address FROM images LIMIT 2500")
+        status_callback("📏 Measuring image payload sizes...")
+        cur.execute("SELECT DISTINCT address FROM images")
         img_urls = [r[0] for r in cur.fetchall()]
         if img_urls:
-            sem = asyncio.Semaphore(12)
+            sem = asyncio.Semaphore(15)
             async def get_img_size(u):
                 async with sem:
                     try:
-                        async with aio_session.head(u, timeout=aiohttp.ClientTimeout(total=4), ssl=ssl_ctx) as r_img:
+                        async with aio_session.head(u, timeout=aiohttp.ClientTimeout(total=6), ssl=ssl_ctx) as r_img:
                             cl = r_img.headers.get('Content-Length')
                             if cl and cl.isdigit():
                                 return u, round(int(cl) / 1024, 2)
@@ -992,16 +910,12 @@ async def execute_crawl(config, progress_callback, status_callback):
                         pass
                     return u, 0.0
 
-            chunk_size = 50
-            for i in range(0, len(img_urls), chunk_size):
-                chunk = img_urls[i:i+chunk_size]
-                img_sizes = await asyncio.gather(*[get_img_size(u) for u in chunk])
-                cur.execute("BEGIN TRANSACTION")
-                cur.executemany("UPDATE images SET size_kb = ? WHERE address = ?", [(sz, u) for u, sz in img_sizes])
-                cur.execute("COMMIT")
+            img_sizes = await asyncio.gather(*[get_img_size(u) for u in img_urls])
+            cur.execute("BEGIN TRANSACTION")
+            cur.executemany("UPDATE images SET size_kb = ? WHERE address = ?", [(sz, u) for u, sz in img_sizes])
+            cur.execute("COMMIT")
 
     conn.close()
-    gc.collect()
     return target_hostname
 
 # ==============================================================================
@@ -1020,7 +934,6 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
     df_links_internal = df_links[df_links['In Scope'] == 1].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame(columns=['source', 'destination', 'anchor', 'nofollow'])
     df_links_external = df_links[df_links['In Scope'] == 0].drop(columns=['In Scope']).copy() if not df_links.empty else pd.DataFrame(columns=['source', 'destination', 'anchor', 'nofollow'])
 
-    # 1. Internal Link Count Calculation
     if not df_internal.empty and not df_links_internal.empty:
         df_internal['__norm'] = df_internal['Address'].apply(normalize_url)
         unique_inlinks = df_links_internal.groupby('destination')['source'].nunique()
@@ -1032,14 +945,12 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
         df_internal['Unique Inlinks'] = 0
         df_internal['Total Inlinks'] = 0
 
-    # 2. Internal PageRank Computation
     pr_raw, pr_score, pr_percentile = calculate_internal_pagerank(df_internal, df_links_internal, damping=pr_damping)
     if not df_internal.empty:
         df_internal['Internal PageRank'] = df_internal['__norm'].map(pr_raw).fillna(0.0)
         df_internal['PageRank Score'] = df_internal['__norm'].map(pr_score).fillna(0.0)
         df_internal['PageRank Percentile'] = df_internal['__norm'].map(pr_percentile).fillna(0.0)
 
-    # 3. Link Equity Waste & Sinkhole Identification
     df_equity_sinkholes = pd.DataFrame()
     if not df_internal.empty:
         high_equity_mask = df_internal['PageRank Percentile'] >= 70.0
@@ -1054,17 +965,14 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
                 'PageRank Score', 'PageRank Percentile', 'Unique Inlinks', 'Crawl Depth'
             ]].sort_values('PageRank Score', ascending=False)
 
-    # 4. Optimized SimHash Near-Duplicate Detection (Capped pairwise loop to prevent OOM)
     near_dup_records = []
     if not df_internal.empty and 'SimHash' in df_internal.columns:
         pages_with_hash = df_internal[df_internal['SimHash'] > 0][['Address', 'Title 1', 'SimHash', 'Word Count', 'Status Code']]
         pages_with_hash = pages_with_hash[pages_with_hash['Status Code'] == 200].to_dict('records')
         
-        # Limit comparisons to max 2,000 pages to avoid quadratic memory freeze
-        limit_pages = pages_with_hash[:2000]
-        for i in range(len(limit_pages)):
-            for j in range(i + 1, min(i + 200, len(limit_pages))):
-                p1, p2 = limit_pages[i], limit_pages[j]
+        for i in range(len(pages_with_hash)):
+            for j in range(i + 1, len(pages_with_hash)):
+                p1, p2 = pages_with_hash[i], pages_with_hash[j]
                 sim = simhash_similarity(p1['SimHash'], p2['SimHash'])
                 if sim >= simhash_threshold:
                     near_dup_records.append({
@@ -1081,10 +989,8 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
     if not df_near_duplicates.empty:
         df_near_duplicates = df_near_duplicates.sort_values('Similarity (%)', ascending=False)
 
-    # 5. Hreflang Validation Matrix
     df_hreflang_matrix, hreflang_issues_count = validate_hreflang_matrix(df_internal)
 
-    # 6. Exact Duplicates
     df_duplicates = pd.DataFrame()
     spa_shell_count = 0
     if not df_internal.empty:
@@ -1110,7 +1016,6 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
         if not dup_hashes.empty and dup_hashes.iloc[0] > (len(df_200) * 0.75) and len(df_200) >= 5:
             spa_shell_count = int(dup_hashes.iloc[0])
 
-    # 7. GSC Data Fusion Integration
     df_gsc_fusion = pd.DataFrame()
     gsc_at_risk_count = 0
     if gsc_df is not None and not gsc_df.empty and not df_internal.empty:
@@ -1127,12 +1032,10 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
             gsc_at_risk_count = int(at_risk_mask.sum())
         df_internal.drop(columns=['__norm_gsc'], errors='ignore', inplace=True)
 
-    # 8. Orphan URLs
     crawled_urls = set(df_internal['Address'].apply(normalize_url)) if not df_internal.empty else set()
     orphan_pages = sitemap_pages_set - crawled_urls
     df_orphans = pd.DataFrame([{"Address": u, "Type": "In sitemap, not reached by crawl"} for u in sorted(orphan_pages)]) if orphan_pages else pd.DataFrame(columns=['Address', 'Type'])
 
-    # 9. Complete Issues Summary Aggregation
     issues = []
     def add_issue(cat, sev, count, desc):
         if count > 0:
@@ -1194,10 +1097,7 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
         df_issues['__sort'] = df_issues['Severity'].map(severity_order)
         df_issues = df_issues.sort_values(['__sort', 'Count'], ascending=[True, False]).drop(columns=['__sort'])
 
-    df_internal.drop(columns=['__norm'], errors='ignore', inplace=True)
     conn.close()
-    gc.collect()
-    
     return {
         "Issues Summary": df_issues,
         "Internal Pages": df_internal,
@@ -1214,7 +1114,7 @@ def run_full_analysis(db_path, gsc_df=None, pr_damping=0.85, simhash_threshold=8
     }
 
 # ==============================================================================
-# 6. MULTI-TAB IN-MEMORY EXCEL EXPORTER
+# 6. IN-MEMORY EXCEL EXPORTER
 # ==============================================================================
 def create_excel_report(data_dict):
     output = BytesIO()
@@ -1232,15 +1132,15 @@ def create_excel_report(data_dict):
     return output
 
 # ==============================================================================
-# 7. STREAMLIT ENTERPRISE AUDITOR INTERFACE
+# 7. STREAMLIT APPLICATION INTERFACE
 # ==============================================================================
 st.set_page_config(page_title="SEO-Diver Enterprise Auditor", page_icon="🕷️", layout="wide")
 
 st.title("🕷️ SEO-Diver Technical Auditor — Enterprise Tier 1")
 st.caption("Enterprise technical SEO crawler: Internal PageRank modeling, SimHash near-duplicate clustering, Hreflang reciprocity matrix, and Google Search Console performance data fusion.")
 
-st.sidebar.header("🎯 Crawl Parameters")
-start_url = st.sidebar.text_input("Start URL", "https://example.com/").strip().rstrip('/')
+st.sidebar.header("Crawl Parameters")
+start_url = st.sidebar.text_input("Start URL", "https://www.example.com/").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
     start_url = 'https://' + start_url
 
@@ -1252,7 +1152,7 @@ scope_mode = st.sidebar.selectbox(
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
-    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=50000, value=2500, step=250)
+    crawl_limit = st.number_input("Crawl Limit", min_value=10, max_value=50000, value=250, step=50)
 with col_b:
     concurrency = st.slider("Concurrency", min_value=1, max_value=24, value=8)
 
