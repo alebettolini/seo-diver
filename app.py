@@ -1240,7 +1240,7 @@ st.title("🕷️ SEO-Diver Technical Auditor — Enterprise Tier 1")
 st.caption("Enterprise technical SEO crawler: Internal PageRank modeling, SimHash near-duplicate clustering, Hreflang reciprocity matrix, and Google Search Console performance data fusion.")
 
 st.sidebar.header("🎯 Crawl Parameters")
-start_url = st.sidebar.text_input("Start URL", "https://almarai.com/").strip().rstrip('/')
+start_url = st.sidebar.text_input("Start URL", "https://example.com/").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
     start_url = 'https://' + start_url
 
