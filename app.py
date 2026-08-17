@@ -892,7 +892,7 @@ st.title("🕷️ SEO-Diver Technical Auditor")
 st.caption("Automated technical SEO crawler, duplicate content analyzer, and indexability engine.")
 
 st.sidebar.header("Crawl Parameters")
-start_url = st.sidebar.text_input("Start URL", "https://www.jeddogeorge.com/").strip().rstrip('/')
+start_url = st.sidebar.text_input("Start URL", "https://www.example.com/").strip().rstrip('/')
 if not start_url.startswith(('http://', 'https://')):
     start_url = 'https://' + start_url
 
