@@ -49,7 +49,7 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. CORE REGEX & PARSING HELPERS
+# 1. CORE REGEX, CONSTANTS & URL HELPERS
 # ==============================================================================
 RE_SITEMAP_DIRECTIVE = re.compile(r'^\s*Sitemap:\s*(\S+)', re.M | re.I)
 RE_CONTENT_TYPE_CHARSET = re.compile(r'charset=([\w-]+)', re.I)
@@ -58,16 +58,20 @@ RE_META_ROBOTS = re.compile(r'^(googlebot|bingbot|robots)$', re.I)
 RE_LINK_CANONICAL = re.compile(r'<([^>]+)>;\s*rel="?canonical"?', re.I)
 RE_SCRIPT_LDJSON = re.compile(r'ld\+json', re.I)
 RE_SPA_MOUNT = re.compile(r'^(root|app|__next)$', re.I)
-BOILERPLATE_CLASS_PATTERN = re.compile(
-    r'\b(nav|navigation|menu|footer|header|sidebar|breadcrumb|cookie|banner|topbar|bottombar|site-header|site-footer|main-menu|main-nav|skip-link)\b',
-    re.IGNORECASE
-)
 
 TITLE_GLYPH_WIDTHS = {'default': 7.0, 'narrow': 3.5, 'wide': 10.0}
 NARROW_CHARS = set("ijlI|.,;:'!`")
 WIDE_CHARS = set("WMmw")
 TITLE_PIXEL_MAX, META_PIXEL_MAX = 580, 920
-ASSET_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif', '.pdf', '.css', '.js', '.ico', '.zip'}
+
+NON_HTML_EXTS = {
+    '.xml', '.gz', '.zip', '.rar', '.tar', '.7z', '.pdf', '.doc', '.docx',
+    '.xls', '.xlsx', '.ppt', '.pptx', '.jpg', '.jpeg', '.png', '.gif',
+    '.webp', '.svg', '.avif', '.ico', '.bmp', '.tiff', '.mp3', '.mp4',
+    '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.css', '.js',
+    '.json', '.txt', '.csv', '.woff', '.woff2', '.ttf', '.eot', '.rss',
+    '.atom'
+}
 
 def extract_registered_domain(netloc):
     if HAS_TLDEXTRACT:
@@ -103,6 +107,21 @@ def normalize_url(url: str, strip_trailing_slash: bool = False, strip_www: bool 
         return urlunparse((p.scheme.lower(), netloc, path, p.params, query, ''))
     except Exception:
         return url
+
+def is_crawlable_url(url: str) -> bool:
+    """Ensure child sitemaps, non-HTML documents, and assets are filtered out."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ('http', 'https'):
+            return False
+        path = p.path.lower()
+        if any(path.endswith(ext) for ext in NON_HTML_EXTS):
+            return False
+        if 'sitemap' in path and path.endswith('.xml'):
+            return False
+        return True
+    except Exception:
+        return False
 
 def estimate_pixel_width(text, scale=1.0):
     if not text:
@@ -154,6 +173,29 @@ class ResponseShim:
             self.text = content.decode('utf-8', errors='replace')
         except Exception:
             self.text = ""
+
+def content_for_hashing(soup):
+    """
+    Extract clean body content for duplicate detection hashing.
+    Only removes <nav>, <header>, <footer>, <aside>, <script>, <style>, <noscript>, <template>, <iframe>, <svg>.
+    Does NOT strip article/product body containers so blog posts and products never produce a null Content Hash.
+    """
+    try:
+        body = soup.find('body') or soup
+        c_soup = BeautifulSoup(str(body), 'html.parser')
+        for tag in list(c_soup(['nav', 'header', 'footer', 'aside', 'script', 'style', 'noscript', 'template', 'iframe', 'svg'])):
+            try:
+                if tag.parent:
+                    tag.decompose()
+            except Exception:
+                pass
+        
+        main = c_soup.find('main') or c_soup.find('article') or c_soup.find(attrs={'role': 'main'})
+        target = main if main else c_soup
+        text = target.get_text(separator=' ', strip=True)
+        return ' '.join(text.lower().split())
+    except Exception:
+        return ""
 
 # ==============================================================================
 # 2. HTML PARSER & DATA ROW BUILDER
@@ -361,44 +403,27 @@ def build_row(url, depth, is_in_scope_fn, resp=None, exc=None, in_sitemap=False)
         "size_kb": 0
     } for img in extract_images(soup, resp.url)]
 
-    # Destructive Parsing Phase 1: Visible Text
-    for tag in list(soup(['script', 'style', 'noscript', 'template', 'iframe', 'svg'])):
+    # Compute visible text and word count
+    clean_soup = BeautifulSoup(resp.text, 'html.parser')
+    for tag in list(clean_soup(['script', 'style', 'noscript', 'template', 'iframe', 'svg'])):
         try:
             if tag.parent: tag.decompose()
         except Exception: pass
     
-    main = soup.find('main') or soup.find('article')
-    visible_target = main if main else soup
+    main = clean_soup.find('main') or clean_soup.find('article') or clean_soup.find(attrs={'role': 'main'})
+    visible_target = main if main else clean_soup
     body_text = visible_target.get_text(separator=' ', strip=True)
     row["Word Count"] = len(body_text.split())
     
-    if row["Word Count"] < 100 and soup.find(id=RE_SPA_MOUNT):
+    if row["Word Count"] < 100 and clean_soup.find(id=RE_SPA_MOUNT):
         row["SPA App Shell"] = "Yes"
         
     if len(resp.content) > 100:
         row["Text/HTML Ratio (%)"] = round(len(body_text) / len(resp.content) * 100, 2)
 
-    # Destructive Parsing Phase 2: Content Deduplication Hash
-    for tag in list(soup(['nav', 'header', 'footer', 'aside'])):
-        try:
-            if tag.parent: tag.decompose()
-        except Exception: pass
-    
-    to_decompose = []
-    for tag in soup.find_all(attrs={'class': True}):
-        cls = tag.get('class')
-        classes = ' '.join(str(c) for c in cls) if isinstance(cls, list) else str(cls)
-        if BOILERPLATE_CLASS_PATTERN.search(classes): to_decompose.append(tag)
-    for tag in soup.find_all(attrs={'id': True}):
-        tid = tag.get('id')
-        if tid and BOILERPLATE_CLASS_PATTERN.search(str(tid)): to_decompose.append(tag)
-    for tag in to_decompose:
-        try:
-            if tag.parent: tag.decompose()
-        except Exception: pass
-
-    normalized = ' '.join(visible_target.get_text(separator=' ', strip=True).lower().split())
-    row["Content Hash"] = hashlib.md5(normalized.encode('utf-8', errors='replace')).hexdigest() if len(normalized) >= 50 else ""
+    # Content Deduplication Hash (preserves article and product content containers)
+    normalized_content = content_for_hashing(clean_soup)
+    row["Content Hash"] = hashlib.md5(normalized_content.encode('utf-8', errors='replace')).hexdigest() if normalized_content else ""
 
     return row, link_rows, image_rows
 
@@ -441,12 +466,16 @@ def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
                     continue
             
             soup = BeautifulSoup(text, 'lxml-xml' if 'xml' in text[:200] else 'html.parser')
+            # Extract child sitemaps strictly into the sitemap parsing queue
             for sm in soup.find_all('sitemap'):
                 loc = sm.find('loc')
-                if loc and loc.text and loc.text.strip() not in seen_sitemaps:
-                    queue.append(loc.text.strip())
-            for u in soup.find_all(['url', 'loc']):
-                loc = u.find('loc') if u.name == 'url' else u
+                if loc and loc.text and loc.text.strip():
+                    child_sm = loc.text.strip()
+                    if child_sm not in seen_sitemaps:
+                        queue.append(child_sm)
+            # Extract page URLs strictly from <url><loc> entries
+            for u in soup.find_all('url'):
+                loc = u.find('loc')
                 if loc and loc.text and loc.text.strip().startswith('http'):
                     all_urls.add(loc.text.strip())
         except Exception:
@@ -455,7 +484,7 @@ def discover_sitemaps(session, target_hostname, root_domain, is_in_scope_fn):
     sitemap_pages = set()
     for u in all_urls:
         norm = normalize_url(u)
-        if is_in_scope_fn(norm) and not any(urlparse(norm).path.lower().endswith(ext) for ext in ASSET_EXTS):
+        if is_in_scope_fn(norm) and is_crawlable_url(norm):
             sitemap_pages.add(norm)
     return sitemap_pages
 
@@ -544,15 +573,12 @@ async def execute_crawl(config, progress_callback, status_callback):
         except Exception:
             pass
 
+    # Architectural Fix 1 & 2: Seed queue with ONLY the Start URL at Depth 0
     visited, queued, queue = set(), set(), deque()
     seed = normalize_url(base_url)
-    queue.append((seed, 0))
-    queued.add(seed)
-
-    for u in list(sitemap_pages)[:crawl_limit]:
-        if u not in queued:
-            queue.append((u, 0))
-            queued.add(u)
+    if is_crawlable_url(seed):
+        queue.append((seed, 0))
+        queued.add(seed)
 
     host_locks = defaultdict(asyncio.Lock)
     host_last_req = defaultdict(lambda: 0.0)
@@ -606,7 +632,18 @@ async def execute_crawl(config, progress_callback, status_callback):
     start_time_crawl = time.time()
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as aio_session:
-        while queue and pages_counted < crawl_limit and processed < fetch_ceiling:
+        while (queue or (pages_counted < crawl_limit and any(u not in visited and u not in queued for u in sitemap_pages))) and pages_counted < crawl_limit and processed < fetch_ceiling:
+            # Low-priority queue padding from sitemap discovery only after primary site graph is explored
+            if not queue and pages_counted < crawl_limit:
+                unvisited_sitemap = [u for u in sitemap_pages if u not in visited and u not in queued]
+                if unvisited_sitemap:
+                    for u in unvisited_sitemap[:(crawl_limit - pages_counted)]:
+                        queue.append((u, 1))
+                        queued.add(u)
+
+            if not queue:
+                break
+
             batch = []
             while queue and len(batch) < concurrency and pages_counted < crawl_limit:
                 url, depth = queue.popleft()
@@ -639,13 +676,16 @@ async def execute_crawl(config, progress_callback, status_callback):
 
                 final_norm = normalize_url(row['Final URL']) if row.get('Final URL') else ""
                 if final_norm and final_norm != normalize_url(url) and is_in_scope(final_norm) and final_norm not in visited and final_norm not in queued:
-                    queue.appendleft((final_norm, depth))
-                    queued.add(final_norm)
+                    if is_crawlable_url(final_norm):
+                        queue.appendleft((final_norm, depth))
+                        queued.add(final_norm)
 
                 for ln in links:
-                    if ln['in_scope'] and not ln['nofollow'] and ln['destination'] not in visited and ln['destination'] not in queued:
-                        queue.append((ln['destination'], depth + 1))
-                        queued.add(ln['destination'])
+                    dest = ln['destination']
+                    if ln['in_scope'] and not ln['nofollow'] and dest not in visited and dest not in queued:
+                        if is_crawlable_url(dest):
+                            queue.append((dest, depth + 1))
+                            queued.add(dest)
 
                 processed += 1
                 if row.get('Indexability') != 'Redirected':
@@ -750,6 +790,7 @@ def run_full_analysis(db_path):
     orphan_pages = sitemap_pages_set - crawled_urls
     df_orphans = pd.DataFrame([{"Address": u, "Type": "In sitemap, not reached by crawl"} for u in sorted(orphan_pages)]) if orphan_pages else pd.DataFrame(columns=['Address', 'Type'])
 
+    # Architectural Fix 3: Complete Issues Summary Aggregation
     issues = []
     def add_issue(cat, sev, count, desc):
         if count > 0:
@@ -757,21 +798,54 @@ def run_full_analysis(db_path):
 
     if not df_internal.empty:
         parsed = df_internal[(df_internal['Status Code'] == 200) & (df_internal['Word Count'] > 0)]
+        
+        # Architecture & Status Issues
         if spa_shell_count > 0:
             add_issue("Architecture", "Critical", spa_shell_count, "Client-Side Rendered (SPA) Shell Detected — Routes return identical raw HTML shell")
         add_issue("Status", "Critical", (df_internal['Status Code'] >= 500).sum(), "5xx Server Errors")
-        add_issue("Status", "Critical", (df_internal['Status Code'] == 404).sum(), "404 Not Found")
+        add_issue("Status", "Critical", (df_internal['Status Code'] == 404).sum(), "404 Not Found Pages")
         add_issue("Status", "High", (df_internal['Status Code'].isin([301, 308])).sum(), "Permanent Redirects (301/308)")
+        
+        # Broken Internal Links (4xx/5xx)
+        if not df_links_internal.empty:
+            status_map = dict(zip(df_internal['Address'].apply(normalize_url), df_internal['Status Code']))
+            dest_statuses = df_links_internal['destination'].map(status_map).fillna(0)
+            broken_int_links_count = int((dest_statuses >= 400).sum())
+            add_issue("Links", "High", broken_int_links_count, "Broken Internal Links (4xx/5xx Destination)")
+
+        # Title Tag Issues
         add_issue("Titles", "High", (parsed['Title Status'] == 'Missing').sum(), "Missing Title Tags")
+        add_issue("Titles", "Medium", (parsed['Title Status'] == 'Too Short').sum(), "Short Title Tags (<200px)")
         add_issue("Titles", "Medium", (parsed['Title Status'] == 'Too Long').sum(), "Titles Exceeding 580px")
         add_issue("Titles", "High", parsed.get('Duplicate Title', pd.Series()).sum(), "Duplicate Titles")
+        
+        # Meta Description Issues
+        add_issue("Meta Description", "High", (parsed['Meta Status'] == 'Missing').sum(), "Missing Meta Descriptions")
+        add_issue("Meta Description", "Medium", (parsed['Meta Status'] == 'Too Long').sum(), "Oversized Meta Descriptions (>920px)")
+        add_issue("Meta Description", "Low", (parsed['Meta Status'] == 'Too Short').sum(), "Short Meta Descriptions (<400px)")
+
+        # Heading Tag Issues (H1)
         add_issue("Headings", "High", (parsed['H1 Count'] == 0).sum(), "Missing H1 Tags")
         add_issue("Headings", "Medium", (parsed['H1 Count'] > 1).sum(), "Multiple H1 Tags")
+        add_issue("Headings", "High", parsed.get('Duplicate H1', pd.Series()).sum(), "Duplicate H1 Tags")
+
+        # Content Issues
         add_issue("Content", "High", parsed.get('Duplicate Content', pd.Series()).sum(), "Identical Body Content (Hash Match)")
         add_issue("Content", "Medium", (parsed['Word Count'] < 200).sum(), "Thin Content (<200 words)")
+        
+        # Canonical Issues
         add_issue("Canonical", "High", (parsed['Canonical Count'] > 1).sum(), "Multiple Canonical Tags")
         add_issue("Canonical", "Medium", (parsed['Canonical Match'] == 'Different').sum(), "Canonicalized to a Different URL")
+        
+        # Hreflang Issues
         add_issue("Hreflang", "High", hreflang_issues, "Missing Return Hreflang Link")
+
+    # Image Issues (Missing Alt & Payload Size > 100 KB)
+    if not df_images.empty:
+        missing_alt_count = int((df_images['Alt Text'].isin(['(Missing)', '', None]) | df_images['Alt Text'].isna()).sum())
+        oversized_images_count = int((df_images['Size (KB)'] > 100).sum())
+        add_issue("Images", "Medium", missing_alt_count, "Images Missing Alt Text")
+        add_issue("Images", "Medium", oversized_images_count, "Images Over 100 KB (Unoptimized)")
 
     df_issues = pd.DataFrame(issues) if issues else pd.DataFrame(columns=['Category', 'Severity', 'Count', 'Description'])
     if not df_issues.empty:
