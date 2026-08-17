@@ -1,0 +1,19 @@
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Crawler SQLite databases & temporary files
+*.db
+*.sqlite
+*.sqlite3
+diver_run_*
+*.xlsx
+
+# OS & Editor artifacts
+.DS_Store
+.vscode/
+.idea/
